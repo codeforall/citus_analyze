@@ -11,6 +11,7 @@
 #   ./citus_analyze.sh                             # uses PG* env vars
 #   ./citus_analyze.sh -h 10.0.0.1 -p 5432 -d citus -U admin
 #   ./citus_analyze.sh --uri "postgres://admin@coord:5432/citus"
+#   ./citus_analyze.sh --psql /opt/pg17/bin/psql -h coord ...
 #   ./citus_analyze.sh -o /tmp/citus_report_2025
 #
 # Exit codes
@@ -50,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         -U|--username)  USERARG="$2"; shift 2;;
         --uri)          URI="$2"; shift 2;;
         -o|--out-dir)   OUT_DIR="$2"; shift 2;;
+        --psql)         PSQL_BIN="$2"; shift 2;;
         --advisors-only) ADVISORS_ONLY=1; shift;;
         --gather-only)  GATHER_ONLY=1; shift;;
         --help)         usage;;
@@ -58,6 +60,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # -------- build psql argv ---------
+# preflight: check psql is actually reachable (after arg parsing so --psql wins)
+if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
+    echo "ERROR: psql not found: '$PSQL_BIN'" >&2
+    echo "  Pass an absolute path with --psql, e.g." >&2
+    echo "    ./citus_analyze.sh --psql /usr/lib/postgresql/17/bin/psql ..." >&2
+    echo "  or set PSQL_BIN in the environment, or add psql to your PATH." >&2
+    exit 2
+fi
+
 PSQL_ARGS=(-X -A -q -v ON_ERROR_STOP=off)
 if [[ -n "$URI" ]]; then
     PSQL_ARGS+=("$URI")

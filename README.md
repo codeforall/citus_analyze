@@ -71,7 +71,9 @@ no schema to create. Inputs are overridable via `-v key=value`.
 
 - PostgreSQL **12+** with Citus **10+** (tested against Citus `main`
   on PG 17; works on Citus 11/12/13 with minor catalog differences).
-- `psql` on `PATH` (or set `PSQL_BIN=/path/to/psql`).
+- `psql` on `PATH` (or set `PSQL_BIN=/full/path/to/psql` — useful on macOS
+  where Postgres.app / Homebrew / source builds often aren't on the
+  system `PATH`).
 - Connect as a role that can read Citus catalogs and call
   `run_command_on_workers()`. For a hardened role, `pg_monitor` +
   `citus_monitoring` (if present) is the minimum; a superuser is
@@ -125,6 +127,21 @@ running advisors ...
 Per-advisor full output lives in `./<out-dir>/{GR1,C3,S3,R1,N6,A3}.out`.
 The raw cluster snapshot is `./<out-dir>/gather.out`.
 
+### HTML report (pg_gather-style)
+
+Any run directory can be turned into a single self-contained HTML report
+(collapsible sections, traffic-light badges, per-advisor drill-down, every
+snapshot section rendered as a browsable table) with the bundled renderer:
+
+```bash
+./render_html.py ./citus_analyze_20260418T005000Z
+# -> ./citus_analyze_20260418T005000Z/report.html
+```
+
+Open `report.html` in any browser. No web server, no DB, no dependencies
+beyond Python 3 stdlib — it parses the `### BEGIN:` / `### END :` markers
+in `gather.out` and the advisor `*.out` files directly.
+
 ---
 
 ## Driver flags
@@ -138,6 +155,7 @@ The raw cluster snapshot is `./<out-dir>/gather.out`.
   -U, --username USER         role
       --uri URI               full libpq URI (overrides -h/-p/-d/-U)
   -o, --out-dir DIR           output directory (default: ./citus_analyze_<ts>)
+      --psql PATH             path to psql binary (overrides PSQL_BIN env, default: psql on PATH)
       --gather-only           run citus_gather.sql, skip advisors
       --advisors-only         run advisors, skip citus_gather.sql
       --help
@@ -279,13 +297,13 @@ Produces 31 sections bracketed by machine-parseable markers:
 ```
 ### BEGIN: <section_id>
 <CSV with header>
-### END  : <section_id>
+### END : <section_id>
 ```
 
 Each section can be extracted with:
 
 ```bash
-awk '/^### BEGIN: cluster_topology$/,/^### END  : cluster_topology$/' gather.out
+awk '/^### BEGIN: cluster_topology$/,/^### END : cluster_topology$/' gather.out
 ```
 
 Sections include: cluster topology, `pg_dist_partition`/`shard`/
