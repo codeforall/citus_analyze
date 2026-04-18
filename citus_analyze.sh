@@ -56,6 +56,8 @@ while [[ $# -gt 0 ]]; do
         --psql)         PSQL_BIN="$2"; shift 2;;
         --coord-ram-mb)  COORD_RAM_MB="$2"; shift 2;;
         --worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
+        --coord-disk-mb)  COORD_DISK_MB="$2"; shift 2;;
+        --worker-disk-mb) WORKER_DISK_MB="$2"; shift 2;;
         --advisors-only) ADVISORS_ONLY=1; shift;;
         --gather-only)  GATHER_ONLY=1; shift;;
         --help)         usage;;
@@ -74,6 +76,12 @@ if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
 fi
 
 PSQL_ARGS=(-X -A -q -v ON_ERROR_STOP=off)
+# Make Citus shard relations visible to our pg_class-based queries.
+# (citus.override_table_visibility=on hides tenantA_102234 etc. from pg_class
+#  so tools don't drown in shard rows. We need to see them to audit them.)
+# application_name is also set for the same reason via
+# citus.show_shards_for_app_name_prefixes in case a deployment enforces it.
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c citus.override_table_visibility=off -c application_name=citus_analyze"
 if [[ -n "$URI" ]]; then
     PSQL_ARGS+=("$URI")
 else
@@ -129,6 +137,16 @@ fi
 # each entry: "id:title:file"
 ADVISORS=(
   "M1:Node memory minimum (OOM-safety):advisors/m1_node_memory_minimum.sql"
+  "D1:Disk capacity & shard-growth runway:advisors/d1_disk_capacity_runway.sql"
+  "Q1:Long-running queries & lock waits:advisors/q1_long_running_queries.sql"
+  "GUC1:Citus + PostgreSQL configuration audit:advisors/guc1_config_audit.sql"
+  "V1:Version & upgrade readiness:advisors/v1_version_readiness.sql"
+  "P1:Partition hygiene & maintenance runway:advisors/p1_partition_hygiene.sql"
+  "I1:Index health (per-shard aware):advisors/i1_index_health.sql"
+  "B1:Table bloat & autovacuum lag:advisors/b1_bloat_autovacuum.sql"
+  "CP1:pgbouncer pool sizing:advisors/cp1_pgbouncer_pool.sql"
+  "R2:Rebalance plan preview:advisors/r2_rebalance_preview.sql"
+  "REF1:Reference-table health:advisors/ref1_reference_table_health.sql"
   "GR1:Shard/partition growth memory model:advisors/gr1_shard_growth_advisor.sql"
   "C3:Max safe external connections (MX-aware):advisors/c3_max_external_connections.sql"
   "S3:Data skew across shards & workers:advisors/s3_data_skew_advisor.sql"
@@ -153,6 +171,8 @@ run_advisor() {
     "$PSQL_BIN" "${PSQL_ARGS[@]}" \
         ${COORD_RAM_MB:+-v coord_ram_mb=$COORD_RAM_MB} \
         ${WORKER_RAM_MB:+-v worker_ram_mb=$WORKER_RAM_MB} \
+        ${COORD_DISK_MB:+-v coord_disk_mb=$COORD_DISK_MB} \
+        ${WORKER_DISK_MB:+-v worker_disk_mb=$WORKER_DISK_MB} \
         -f "$path" > "$out" 2> "$err" || true
 
     # Pick the most severe verdict line anywhere in the output (advisors
@@ -222,7 +242,7 @@ badge() {
         1) echo "  OVERALL: WARN - at least one advisor returned WARN.";;
         2) echo "  OVERALL: CRITICAL - at least one advisor returned CRITICAL.";;
     esac
-    echo "  Full per-advisor output: $OUT_DIR/{GR1,C3,S3,R1,N6,A3}.out"
+    echo "  Full per-advisor output: $OUT_DIR/{M1,D1,Q1,GUC1,V1,P1,I1,B1,CP1,R2,REF1,GR1,C3,S3,R1,N6,A3}.out"
     echo "  Raw cluster snapshot:    $GATHER_OUT"
     echo
 } | tee -a "$SUMMARY"

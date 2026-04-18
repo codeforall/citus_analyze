@@ -102,11 +102,204 @@ def _rec_a3(text: str) -> str:
     return '0 orphaned 2PC records'
 
 
+def _rec_d1(text: str) -> str:
+    # Extract the minimum runway observed across nodes.
+    runways = [int(m.group(1))
+               for m in re.finditer(r'runway at current rate\s*:\s*(\d+)\s*days', text)]
+    free_pcts = [float(m.group(1))
+                 for m in re.finditer(r'(-?[\d.]+)%\s*of disk', text)]
+    parts = []
+    if runways:
+        parts.append(f'runway ≥ 90 days (current worst {min(runways)})')
+    if free_pcts:
+        parts.append(f'≥ 20% free (current worst {min(free_pcts):.1f}%)')
+    if parts:
+        return '; '.join(parts)
+    return '≥ 20% free and ≥ 90 days runway per node'
+
+
+def _rec_q1(text: str) -> str:
+    # Summarise current session pressure from the headline-ish lines.
+    # Look for "N long active + M idle-in-tx session(s); K cross-node lock wait(s)"
+    m = re.search(r'(\d+)\s+long active\s*\+\s*(\d+)\s+idle-in-tx.*?(\d+)\s+cross-node lock wait',
+                  text)
+    if m:
+        la, iit, lw = m.group(1), m.group(2), m.group(3)
+        return (f'0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits '
+                f'(currently {la} / {iit} / {lw})')
+    if re.search(r'no long-running queries or idle-in-tx sessions', text):
+        return '0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits'
+    return '0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits'
+
+
+def _rec_guc1(text: str) -> str:
+    # Look for CRITICAL / WARN counts in the headline.
+    m = re.search(r'(\d+)\s+rule violation\(s\);\s*(\d+)\s+drift\(s\);\s*(\d+)\s+warning',
+                  text)
+    if m:
+        return (f'0 rule violations; 0 drift; 0 warnings '
+                f'(currently {m.group(1)} / {m.group(2)} / {m.group(3)})')
+    m = re.search(r'(\d+)\s+rule warning\(s\);\s*(\d+)\s+cross-node drift', text)
+    if m:
+        return (f'0 rule violations; 0 drift; 0 warnings '
+                f'(currently 0 / {m.group(2)} / {m.group(1)})')
+    if re.search(r'no drift and no rule violations', text):
+        return '0 rule violations; 0 drift; 0 warnings'
+    return '0 rule violations; 0 drift; 0 warnings'
+
+
+def _rec_v1(text: str) -> str:
+    if re.search(r'matching PG major and Citus versions, no pending upgrades', text):
+        return 'all nodes matching PG major + Citus version; no pending upgrades'
+    if re.search(r'Citus BINARY package version differs', text):
+        return 'homogeneous Citus binary package version (currently DRIFTED)'
+    if re.search(r'Citus extension SQL version differs', text):
+        return 'homogeneous Citus extension version (currently DRIFTED)'
+    if re.search(r"missing 'citus' from shared_preload_libraries", text):
+        return "'citus' in shared_preload_libraries on every node"
+    if re.search(r'PostgreSQL MAJOR version differs', text):
+        return 'same PostgreSQL major on every node'
+    if re.search(r'pending ALTER EXTENSION citus UPDATE', text):
+        return '0 nodes with pending ALTER EXTENSION citus UPDATE'
+    if re.search(r'missing on at least one worker', text):
+        return 'coord extensions fully present on every worker'
+    if re.search(r'could upgrade Citus to a newer available version', text):
+        return 'installed Citus = latest available (informational)'
+    return 'all nodes matching PG major + Citus version; no pending upgrades'
+
+
+def _rec_p1(text: str) -> str:
+    if re.search(r'no partition covering now\(\)', text):
+        return 'every time-partitioned table covers now() or has a DEFAULT partition'
+    if re.search(r'future partition gap', text):
+        return '0 future partition gaps (no imminent write failure)'
+    if re.search(r'partition range overlap', text):
+        return 'no overlapping partition ranges (catalog clean)'
+    if re.search(r'less than \S+ days of future partitions', text):
+        return 'sufficient future partition runway for every time-partitioned table'
+    if re.search(r'historical partition gap', text):
+        return 'no historical partition gaps'
+    if re.search(r'exceed partition/shard limits', text):
+        return 'no partitioned table exceeds the partition/shard width limits'
+    if re.search(r'further than \S+ days in the future', text):
+        return 'no over-premade future partitions'
+    if re.search(r'time_partitions view not available', text):
+        return 'Citus time_partitions view available (requires Citus >= 10.0)'
+    return 'adequate partition runway, no gaps, no width hotspots'
+
+
+def _rec_i1(text: str) -> str:
+    if re.search(r'INVALID or NOT-READY index', text):
+        return '0 invalid/not-ready indexes (REINDEX/DROP recommended on hits)'
+    if re.search(r'pg_stat counters reset only', text):
+        return 'pg_stat history old enough to trust unused-index verdict'
+    if re.search(r'with 0 scans across all shards', text):
+        return '0 unused distributed-table indexes (every index is read at least once)'
+    if re.search(r'duplicate index pair', text):
+        return '0 duplicate indexes'
+    if re.search(r'unreachable; index health', text):
+        return 'all nodes reachable for index health check'
+    return 'no invalid indexes, no unused distributed indexes, no duplicates'
+
+
+def _rec_b1(text: str) -> str:
+    m = re.search(r'(\d+)\s+relation\(s\)\s*>=\s*(\d+)%\s+dead tuples', text)
+    if m:
+        return f'< {m.group(2)}% dead tuples per relation (currently {m.group(1)} over)'
+    if re.search(r'past their autovacuum trigger', text):
+        return 'no relations past their autovacuum trigger'
+    if re.search(r'autovacuum_max_workers fully busy', text):
+        return 'autovacuum_max_workers headroom on every node'
+    if re.search(r'stale ANALYZE', text):
+        return 'fresh ANALYZE on every distributed shard'
+    if re.search(r'bloat estimate is unreliable', text):
+        return 'pg_stat history old enough to trust bloat estimate'
+    if re.search(r'unreachable; bloat', text):
+        return 'all nodes reachable for bloat check'
+    return 'bloat under control, autovacuum keeping up, ANALYZE fresh'
+
+
+def _rec_cp1(text: str) -> str:
+    m = re.search(r'pool_size\s+range\s+(\d+)\.\.(\d+)', text)
+    if m:
+        return f'pgbouncer pool_size {m.group(1)}–{m.group(2)} per entry node (transaction mode)'
+    if re.search(r'ALREADY over the safe external cap', text):
+        return 'reduce client traffic or scale pool DOWN before adopting recs'
+    if re.search(r'80% of safe cap', text):
+        return 'adopt CP1a recommendations before next traffic peak'
+    if re.search(r'per-db pool sums above the safe cap', text):
+        return 'partition the per-db pool budget; sum must respect safe cap'
+    if re.search(r'PG <14.*prepared statements is unsupported', text):
+        return 'disable prepared statements in app, or upgrade PG to 14+'
+    return 'pool_size sized within safe cap; transaction mode in pgbouncer'
+
+
+
+def _rec_ref1(text: str) -> str:
+    if re.search(r'no reference tables defined', text):
+        return 'no reference tables'
+    if re.search(r'missing placements', text):
+        return 'run SELECT replicate_reference_tables() to restore placements'
+    m = re.search(r'(\d+) reference table\(s\) exceed (\d+) MB per copy', text)
+    if m:
+        return f'{m.group(1)} ref(s) over {m.group(2)} MB/copy: consider distributing instead'
+    if re.search(r'are oversized', text):
+        return 'oversized reference tables waste worker RAM per copy'
+    if re.search(r'size drift across workers', text):
+        return 'investigate replication: copies diverge across workers'
+    if re.search(r'extra placements', text):
+        return 'run citus_cleanup_orphaned_resources() to remove extra placements'
+    return 'reference tables healthy'
+
+
+def _rec_r2(text: str) -> str:
+    if re.search(r'cluster is balanced', text):
+        return 'no rebalance needed under default strategy'
+    m = re.search(r'(\d+)\s+moves,\s+([^;]+);.*est wall time\s+(\d+)\s*s', text)
+    if m:
+        return f'plan: {m.group(1)} moves, {m.group(2).strip()}, ~{m.group(3)}s'
+    if re.search(r'target\(s\) would >2x', text):
+        return 'verify free disk on target nodes before citus_rebalance_start()'
+    if re.search(r'by_shard_count but shards vary', text):
+        return 'switch default rebalance_strategy to by_disk_size'
+    return 'review R2a-R2f before invoking citus_rebalance_start()'
+
+
 # (id, title, short blurb, extractor)
 ADVISORS = [
     ("M1",  "Node memory minimum (OOM-safety)",
      "Bottom-up per-node RAM model (shared_buffers + backends + AV + WAL + MX pool + OS).",
      _rec_m1),
+    ("D1",  "Disk capacity & shard-growth runway",
+     "Per-node used/free space, historical growth rate, and days-until-full projection.",
+     _rec_d1),
+    ("Q1",  "Long-running queries & lock waits",
+     "Snapshots long active queries, idle-in-tx, citus_lock_waits, and ungranted locks.",
+     _rec_q1),
+    ("GUC1", "Citus + PostgreSQL configuration audit",
+     "Cross-node GUC drift + rule-based checks on 30+ availability-sensitive settings.",
+     _rec_guc1),
+    ("V1",  "Version & upgrade readiness",
+     "Per-node PG/Citus version match, pending ALTER EXTENSION UPDATE, extension drift.",
+     _rec_v1),
+    ("P1",  "Partition hygiene & maintenance runway",
+     "Future-partition runway, gap detection, partition/shard width limits, pg_partman reality check.",
+     _rec_p1),
+    ("I1",  "Index health (per-shard aware)",
+     "Invalid indexes, unused distributed-table indexes (0 scans across all shards), duplicates, missing FK indexes.",
+     _rec_i1),
+    ("B1",  "Table bloat & autovacuum lag",
+     "Per-shard estimated dead-tuple ratio, past-due autovacuum triggers, suggested per-table scale_factor, AV worker saturation, stale ANALYZE.",
+     _rec_b1),
+    ("CP1", "pgbouncer pool sizing",
+     "Per-entry-node pool_size, max_client_conn, reserve/min pool, multi-db budget, copy-paste pgbouncer.ini.",
+     _rec_cp1),
+    ("R2",  "Rebalance plan preview",
+     "Dry-run of get_rebalance_table_shards_plan(); bytes moved, per-worker impact, disk amplification, strategy sanity, wall-time estimate.",
+     _rec_r2),
+    ("REF1", "Reference-table health",
+     "Per-reference-table inventory, oversize warnings, placement count mismatches, size drift across workers.",
+     _rec_ref1),
     ("GR1", "Shard / partition growth memory model",
      "Per-backend cache growth + PG lock-hash capacity (lpt × (MaxBackends + mpx)).",
      _rec_gr1),
