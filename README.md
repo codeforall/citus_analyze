@@ -131,17 +131,34 @@ The raw cluster snapshot is `./<out-dir>/gather.out`.
 ### HTML report (pg_gather-style)
 
 Any run directory can be turned into a single self-contained HTML report
-(collapsible sections, traffic-light badges, per-advisor drill-down, every
-snapshot section rendered as a browsable table) with the bundled renderer:
+with the bundled renderer:
 
 ```bash
 ./render_html.py ./citus_analyze_20260418T005000Z
 # -> ./citus_analyze_20260418T005000Z/report.html
 ```
 
-Open `report.html` in any browser. No web server, no DB, no dependencies
-beyond Python 3 stdlib — it parses the `### BEGIN:` / `### END :` markers
-in `gather.out` and the advisor `*.out` files directly.
+The report includes:
+
+- **Sticky top bar** with overall-verdict chip and quick jump links.
+- **Executive summary table** with five columns: *Severity*, *ID*,
+  *Advisor*, *Current finding*, and **Minimum recommended** — the last
+  column extracts the exact target number from each advisor's output
+  (e.g. `≥ 3.92 GB per node`, `max_locks_per_transaction ≥ 320`,
+  `≤ 136 concurrent external sessions`, `shard max/avg ≤ 2.0 per
+  colocation group`).
+- **Per-advisor cards** with a structured *Finding / Recommended* block
+  plus a collapsible full raw output.
+- **Cluster snapshot** section with a live text filter over all
+  `### BEGIN:` blocks in `gather.out`, each rendered as a sortable
+  browsable table.
+- **Driver `summary.txt`** rendered verbatim.
+- **Auto dark-mode** via `prefers-color-scheme` so it reads well in both
+  light and dark terminals / viewers.
+
+No web server, no DB, no dependencies beyond Python 3 stdlib — it parses
+the `### BEGIN:` / `### END :` markers in `gather.out` and the advisor
+`*.out` files directly.
 
 ---
 

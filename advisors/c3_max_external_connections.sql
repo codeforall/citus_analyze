@@ -141,7 +141,19 @@ per_target AS (
                (n.inbound_budget::numeric * s.safety) * s.n_mx
                / ((s.n_mx - CASE WHEN n.is_mx THEN 1 ELSE 0 END) * s.k_reuse)
              )::int
-           END AS cap_from_aggregate_inbound
+           END AS cap_from_aggregate_inbound,
+           -- (4) COMBINED inbound cap for MX nodes that also serve as shard
+           -- targets. They receive (S/|MX|) external sessions plus
+           -- ((|MX|-1)/|MX|) * S * K_reuse internal connections from peer MX
+           -- entries. Total must fit inbound_budget * safety. Solving for S:
+           --   S <= inbound * safety * |MX| / (1 + (|MX|-1) * K_reuse)
+           CASE WHEN n.is_mx AND s.n_mx > 0 THEN
+              floor(
+                (n.inbound_budget::numeric * s.safety * s.n_mx)
+                / (1.0 + (s.n_mx - 1) * s.k_reuse)
+              )::int
+             ELSE NULL
+           END AS cap_from_combined_inbound
     FROM _c3_nodes n, sizes s
 )
 SELECT
@@ -162,6 +174,14 @@ SELECT
        FROM per_target
        WHERE cap_from_aggregate_inbound = (SELECT min(cap_from_aggregate_inbound) FROM per_target)
        LIMIT 1)                                       AS target_bottleneck_label,
+    (SELECT min(cap_from_combined_inbound) FROM per_target WHERE is_mx) AS cap_combined_min,
+    (SELECT format('%s:%s (combined external+internal inbound)',
+                   nodename, nodeport)
+       FROM per_target
+       WHERE is_mx
+         AND cap_from_combined_inbound = (SELECT min(cap_from_combined_inbound)
+                                            FROM per_target WHERE is_mx)
+       LIMIT 1)                                       AS combined_bottleneck_label,
     (SELECT n_mx FROM sizes),
     (SELECT n_workers FROM sizes),
     (SELECT k_reuse FROM sizes),
@@ -239,24 +259,33 @@ ORDER BY cap_S_aggregate;
 \echo '-- Headline --'
 \pset tuples_only on
 SELECT format('MAX SAFE EXTERNAL CONCURRENCY : %s  (bottleneck: %s)',
-              LEAST(cap_entry_min, cap_target_min),
-              CASE WHEN cap_entry_min <= cap_target_min
-                   THEN entry_bottleneck_label
-                   ELSE target_bottleneck_label END)
+              LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)),
+              CASE
+                WHEN cap_combined_min IS NOT NULL
+                     AND cap_combined_min <= LEAST(cap_entry_min, cap_target_min)
+                  THEN combined_bottleneck_label
+                WHEN cap_entry_min <= cap_target_min
+                  THEN entry_bottleneck_label
+                ELSE target_bottleneck_label
+              END)
 FROM _c3_summary;
 
 SELECT format('   - Entry-point min cap   : %s  (%s)',   cap_entry_min,  entry_bottleneck_label)  FROM _c3_summary;
 SELECT format('   - Target-aggregate min  : %s  (%s)',   cap_target_min, target_bottleneck_label) FROM _c3_summary;
+SELECT format('   - Combined ext+int cap  : %s  (%s)',
+              COALESCE(cap_combined_min::text, 'n/a'),
+              COALESCE(combined_bottleneck_label, 'no MX nodes serving as shard targets'))
+FROM _c3_summary;
 
 SELECT
   CASE
-    WHEN LEAST(cap_entry_min, cap_target_min) <= 0
+    WHEN LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)) <= 0
       THEN 'CRITICAL : no headroom. Raise max_connections or max_shared_pool_size before accepting external traffic.'
-    WHEN LEAST(cap_entry_min, cap_target_min) < 50
+    WHEN LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)) < 50
       THEN format('WARN : only %s concurrent external sessions safe. Consider pooling (pgbouncer) in front of entry points.',
-                  LEAST(cap_entry_min, cap_target_min))
+                  LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)))
     ELSE format('OK : safe up to %s concurrent external sessions under current config.',
-                  LEAST(cap_entry_min, cap_target_min))
+                  LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)))
   END
 FROM _c3_summary;
 

@@ -96,7 +96,22 @@ facts AS (
                     WHERE p.partmethod IN ('h','r')), 1)
           END, 1)                                                                    AS avg_idx_per_shard,
         (SELECT count(*)::int FROM pg_stat_activity
-           WHERE backend_type='client backend' AND pid <> pg_backend_pid())          AS backends_now
+           WHERE backend_type='client backend' AND pid <> pg_backend_pid())          AS backends_now,
+        -- Lock-table pressure is per-node. Size the budget for the HOTTEST node —
+        -- in a balanced cluster that's ~shards/workers placements; in a skewed
+        -- cluster (or a 1-worker cluster) one node holds everything. For the
+        -- coordinator or MX entry point the model uses total shards.
+        GREATEST(
+          COALESCE((SELECT max(c) FROM (
+             SELECT count(*) AS c FROM pg_dist_placement p GROUP BY p.groupid
+          ) x), 1),
+          1
+        )                                                                            AS max_placements_per_node,
+        GREATEST(
+          COALESCE((SELECT count(*) FROM pg_dist_node
+                     WHERE isactive AND shouldhaveshards AND noderole='primary'), 1),
+          1
+        )                                                                            AS n_workers_eff
 ),
 tgt AS (
     SELECT
@@ -153,7 +168,25 @@ LATERAL (
     (:k_lockslot::bigint * f.max_lpt
        * ((f.max_conn + f.av_workers + f.wal_senders + f.worker_procs) + f.max_prep)
     )                                                                 AS lock_bytes_now,
-    (t.t_shards_total::bigint
+    -- Per-node peak lock pressure from a cross-shard backend. The lock table
+    -- is per-node, so we size by the HOTTEST node:
+    --   * Coordinator (or MX entry) backend planning a cross-shard xact holds
+    --     LockShardDistributionMetadata on every target shard -> total shards.
+    --   * Worker backend executing that xact only holds locks on its local
+    --     placements -> projected max placements on any single worker.
+    -- Take the max so lpt_needed is safe for whichever node is hottest.
+    (GREATEST(
+        t.t_shards_total,
+        CEIL(
+          -- projected max placements per worker after the change. If the user
+          -- hasn't grown shards, keep the currently-observed maximum; otherwise
+          -- assume balanced distribution to the worker count.
+          CASE WHEN t.t_shards_total = f.shards_now
+               THEN f.max_placements_per_node
+               ELSE (t.t_shards_total * t.t_rf)::numeric / f.n_workers_eff
+          END
+        )
+     )::bigint
        * (1 + f.avg_idx_per_shard
             + CASE WHEN :write_mode = 1 THEN 2 ELSE 0 END)
     )                                                                 AS peak_locks_per_xshard_backend,

@@ -35,11 +35,15 @@
 --   :baseline_backend_mb    minimum per-backend RSS excluding work_mem (default 10)
 --   :os_reserve_mb          floor on OS/kernel+filesystem reserve (default 1024)
 --   :os_reserve_pct         percentage reserve if larger than os_reserve_mb (default 10)
+--   :burst_maint_ops        concurrent CREATE INDEX / REINDEX / manual VACUUM bursts
+--                           counted on top of autovacuum (default 2; heuristic)
+--   :k_meta_per_shard       bytes per cached shard in Citus metadata cache (default 160)
+--   :k_meta_per_placement   bytes per cached placement replica (default 40)
 --
--- Verdict
---   CRITICAL : measured RAM < peak_ram        (will OOM under load)
---   WARN     : measured RAM < min_ram * 1.5   (no burst headroom; flappy cluster)
---   OK       : measured RAM >= peak_ram       (safe)
+-- Verdict (gated on RECOMMENDED = PEAK + OS reserve, so OK means safe INCLUDING OS)
+--   CRITICAL : measured RAM < peak_ram            (will OOM under load)
+--   WARN     : measured RAM < recommended_ram     (fits peak but no OS headroom)
+--   OK       : measured RAM >= recommended_ram    (safe with OS reserve)
 --   INFO     : coord_ram_mb / worker_ram_mb not provided (comparison skipped)
 -- =====================================================================
 
@@ -53,6 +57,9 @@
 \if :{?baseline_backend_mb} \else \set baseline_backend_mb 10 \endif
 \if :{?os_reserve_mb}       \else \set os_reserve_mb 1024     \endif
 \if :{?os_reserve_pct}      \else \set os_reserve_pct 10      \endif
+\if :{?burst_maint_ops}     \else \set burst_maint_ops 2      \endif
+\if :{?k_meta_per_shard}    \else \set k_meta_per_shard 160   \endif
+\if :{?k_meta_per_placement} \else \set k_meta_per_placement 40 \endif
 
 \echo
 \echo '==================== M1 : node memory minimum ===================='
@@ -121,8 +128,12 @@ SELECT
          ELSE 'worker' END                                     AS role,
     n.nodename, n.nodeport, n.hasmetadata,
     COALESCE((SELECT count(*) FROM pg_dist_placement p WHERE p.groupid = n.groupid), 0) AS local_placements,
-    -- metadata cache on this node's backends: MX entry nodes see ALL placements (routing),
-    -- a pure worker only needs its own.
+    -- cached_shards/placements on this node's backends: MX entry nodes see ALL shards
+    -- (routing), a pure worker only needs its own local placements.
+    CASE WHEN n.hasmetadata OR n.groupid = 0
+         THEN (SELECT total_shards FROM _m1)
+         ELSE COALESCE((SELECT count(DISTINCT shardid) FROM pg_dist_placement p WHERE p.groupid = n.groupid), 0)
+    END                                                        AS cached_shards,
     CASE WHEN n.hasmetadata OR n.groupid = 0
          THEN (SELECT total_placements FROM _m1)
          ELSE COALESCE((SELECT count(*) FROM pg_dist_placement p WHERE p.groupid = n.groupid), 0)
@@ -139,12 +150,23 @@ WITH base AS (
            m.shbuf_mb, m.work_mem_mb, m.maint_mem_mb, m.wal_buffers_mb, m.temp_buffers_mb,
            m.max_conn, m.av_workers, m.max_par_workers,
            m.cx_shared_pool,
-           -- 200 bytes per cached placement, converted to MB
-           (nd.cached_placements * 200.0) / 1048576.0       AS cx_meta_mb_per_backend,
-           -- outbound pool: MX entry nodes hold up to max_shared_pool_size connections
-           -- each costing ~1 MB of libpq + result-buffer overhead
+           -- citus.max_shared_pool_size = -1 means "no Citus-imposed limit" (falls
+           -- back to max_connections on the target). Coerce to max_conn so the
+           -- outbound-pool memory term doesn't go negative.
+           CASE WHEN m.cx_shared_pool IS NULL OR m.cx_shared_pool < 0
+                THEN m.max_conn
+                ELSE m.cx_shared_pool
+           END                                             AS cx_shared_pool_eff,
+           -- Citus metadata cache: decomposed as shards + placements so the
+           -- model scales correctly with replication_factor > 1.
+           (nd.cached_shards    * (:k_meta_per_shard)::numeric
+          + nd.cached_placements * (:k_meta_per_placement)::numeric) / 1048576.0
+                                                           AS cx_meta_mb_per_backend,
+           -- outbound pool: MX entry nodes hold up to max_shared_pool_size
+           -- connections each costing ~1 MB of libpq + result-buffer overhead
            CASE WHEN nd.hasmetadata OR nd.role = 'coordinator'
-                THEN m.cx_shared_pool * 1.0
+                THEN (CASE WHEN m.cx_shared_pool IS NULL OR m.cx_shared_pool < 0
+                           THEN m.max_conn ELSE m.cx_shared_pool END) * 1.0
                 ELSE 0 END                                  AS cx_outbound_mb
     FROM _m1_nodes nd CROSS JOIN _m1 m
 )
@@ -158,7 +180,7 @@ FROM base;
 -- Final roll-up with minimum + peak for each node
 \pset tuples_only on
 SELECT format(
-'%s  %s:%s   (role: %s, local_placements=%s, cached_placements=%s)
+'%s  %s:%s   (role: %s, local_placements=%s, cached_shards=%s, cached_placements=%s)
   shared_buffers              : %s MB
   per-backend steady          : %s MB  (baseline %s + citus_meta %s + work_mem %s)
   per-backend peak            : %s MB  (baseline %s + citus_meta %s + %s*work_mem %s)
@@ -175,7 +197,7 @@ SELECT format(
   RECOMMENDED NODE RAM        : %s MB  ~  %s GB
   %s',
     '----',
-    c.nodename, c.nodeport, c.role, c.local_placements, c.cached_placements,
+    c.nodename, c.nodeport, c.role, c.local_placements, c.cached_shards, c.cached_placements,
     round(c.shbuf_mb, 1),
     round(c.per_backend_steady_mb, 2),
     :baseline_backend_mb, round(c.cx_meta_mb_per_backend, 3), round(c.work_mem_mb, 1),
@@ -199,13 +221,13 @@ SELECT format(
     -- PEAK RAM (burst)
     round(c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
           + c.av_workers * c.maint_mem_mb
-          + 2 * c.maint_mem_mb
+          + (:burst_maint_ops)::numeric * c.maint_mem_mb
           + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
           + c.cx_outbound_mb, 0),
     round((c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
           + c.av_workers * c.maint_mem_mb
-          + 2 * c.maint_mem_mb
+          + (:burst_maint_ops)::numeric * c.maint_mem_mb
           + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
           + c.cx_outbound_mb) / 1024.0, 2),
@@ -213,7 +235,7 @@ SELECT format(
     round(greatest(:os_reserve_mb::numeric,
                    (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
                     + c.av_workers * c.maint_mem_mb
-                    + 2 * c.maint_mem_mb
+                    + (:burst_maint_ops)::numeric * c.maint_mem_mb
                     + c.max_par_workers * c.work_mem_mb
                     + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
                     + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0)), 0),
@@ -222,14 +244,14 @@ SELECT format(
     round(
       c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
       + c.av_workers * c.maint_mem_mb
-      + 2 * c.maint_mem_mb
+      + (:burst_maint_ops)::numeric * c.maint_mem_mb
       + c.max_par_workers * c.work_mem_mb
       + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
       + c.cx_outbound_mb
       + greatest(:os_reserve_mb::numeric,
                  (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
                   + c.av_workers * c.maint_mem_mb
-                  + 2 * c.maint_mem_mb
+                  + (:burst_maint_ops)::numeric * c.maint_mem_mb
                   + c.max_par_workers * c.work_mem_mb
                   + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
                   + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0)),
@@ -237,19 +259,20 @@ SELECT format(
     round((
       c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
       + c.av_workers * c.maint_mem_mb
-      + 2 * c.maint_mem_mb
+      + (:burst_maint_ops)::numeric * c.maint_mem_mb
       + c.max_par_workers * c.work_mem_mb
       + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
       + c.cx_outbound_mb
       + greatest(:os_reserve_mb::numeric,
                  (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
                   + c.av_workers * c.maint_mem_mb
-                  + 2 * c.maint_mem_mb
+                  + (:burst_maint_ops)::numeric * c.maint_mem_mb
                   + c.max_par_workers * c.work_mem_mb
                   + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
                   + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0))
     ) / 1024.0, 2),
-    -- verdict line per node
+    -- verdict line per node: compare measured RAM against PEAK (CRITICAL threshold)
+    -- and RECOMMENDED = PEAK + OS_reserve (WARN if between, OK if at or above).
     CASE
       WHEN (c.role = 'coordinator' AND :coord_ram_mb::int  = 0)
         OR (c.role LIKE 'worker%%'  AND :worker_ram_mb::int = 0)
@@ -257,31 +280,47 @@ SELECT format(
                   CASE WHEN c.role='coordinator' THEN 'coord' ELSE 'worker' END)
       WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < (
             c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
-            + c.av_workers * c.maint_mem_mb + 2*c.maint_mem_mb
+            + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
             + c.max_par_workers * c.work_mem_mb
             + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
             + c.cx_outbound_mb))
         OR (c.role LIKE 'worker%%' AND :worker_ram_mb::numeric < (
             c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
-            + c.av_workers * c.maint_mem_mb + 2*c.maint_mem_mb
+            + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
             + c.max_par_workers * c.work_mem_mb
             + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
             + c.cx_outbound_mb))
       THEN format('CRITICAL : measured RAM (%s MB) < PEAK RAM requirement. Node WILL OOM under load.',
                   CASE WHEN c.role='coordinator' THEN :coord_ram_mb ELSE :worker_ram_mb END)
-      WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < 1.5 * (
-            c.shbuf_mb + c.max_conn * c.per_backend_steady_mb
-            + c.av_workers * c.maint_mem_mb
+      WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < (
+            c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+            + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
+            + c.max_par_workers * c.work_mem_mb
             + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
-            + c.cx_outbound_mb))
-        OR (c.role LIKE 'worker%%' AND :worker_ram_mb::numeric < 1.5 * (
-            c.shbuf_mb + c.max_conn * c.per_backend_steady_mb
-            + c.av_workers * c.maint_mem_mb
+            + c.cx_outbound_mb
+            + greatest(:os_reserve_mb::numeric,
+                       (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+                        + c.av_workers * c.maint_mem_mb
+                        + (:burst_maint_ops)::numeric*c.maint_mem_mb
+                        + c.max_par_workers * c.work_mem_mb
+                        + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
+                        + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0))))
+        OR (c.role LIKE 'worker%%' AND :worker_ram_mb::numeric < (
+            c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+            + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
+            + c.max_par_workers * c.work_mem_mb
             + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
-            + c.cx_outbound_mb))
-      THEN format('WARN : measured RAM (%s MB) < 1.5 * MIN RAM. No burst headroom; node will be OOM-prone.',
+            + c.cx_outbound_mb
+            + greatest(:os_reserve_mb::numeric,
+                       (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+                        + c.av_workers * c.maint_mem_mb
+                        + (:burst_maint_ops)::numeric*c.maint_mem_mb
+                        + c.max_par_workers * c.work_mem_mb
+                        + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
+                        + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0))))
+      THEN format('WARN : measured RAM (%s MB) fits PEAK but leaves no OS reserve; below RECOMMENDED.',
                   CASE WHEN c.role='coordinator' THEN :coord_ram_mb ELSE :worker_ram_mb END)
-      ELSE format('OK : measured RAM (%s MB) >= PEAK RAM recommendation.',
+      ELSE format('OK : measured RAM (%s MB) >= RECOMMENDED (PEAK + OS reserve).',
                   CASE WHEN c.role='coordinator' THEN :coord_ram_mb ELSE :worker_ram_mb END)
     END
 ) AS "Per-node memory model"
@@ -295,7 +334,7 @@ SELECT CASE
     format('CRITICAL : %s node(s) have less RAM than the peak-burst requirement. OOM is expected under load. See per-node RECOMMENDED NODE RAM values above.',
            count(*) FILTER (WHERE sev='CRITICAL'))
   WHEN bool_or(sev = 'WARN') THEN
-    format('WARN : %s node(s) have RAM below 1.5x MIN RAM; no burst headroom.',
+    format('WARN : %s node(s) fit PEAK RAM but are below RECOMMENDED (no OS reserve).',
            count(*) FILTER (WHERE sev='WARN'))
   WHEN bool_or(sev = 'INFO') THEN
     'INFO : pass -v coord_ram_mb=... -v worker_ram_mb=... to get a pass/fail verdict against measured RAM.'
@@ -309,27 +348,43 @@ FROM (
       THEN 'INFO'
     WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < (
           c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
-          + c.av_workers * c.maint_mem_mb + 2*c.maint_mem_mb
+          + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
           + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
           + c.cx_outbound_mb))
       OR (c.role LIKE 'worker%' AND :worker_ram_mb::numeric < (
           c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
-          + c.av_workers * c.maint_mem_mb + 2*c.maint_mem_mb
+          + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
           + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
           + c.cx_outbound_mb))
       THEN 'CRITICAL'
-    WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < 1.5 * (
-          c.shbuf_mb + c.max_conn * c.per_backend_steady_mb
-          + c.av_workers * c.maint_mem_mb
+    WHEN (c.role = 'coordinator' AND :coord_ram_mb::numeric < (
+          c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+          + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
+          + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
-          + c.cx_outbound_mb))
-      OR (c.role LIKE 'worker%' AND :worker_ram_mb::numeric < 1.5 * (
-          c.shbuf_mb + c.max_conn * c.per_backend_steady_mb
-          + c.av_workers * c.maint_mem_mb
+          + c.cx_outbound_mb
+          + greatest(:os_reserve_mb::numeric,
+                     (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+                      + c.av_workers * c.maint_mem_mb
+                      + (:burst_maint_ops)::numeric*c.maint_mem_mb
+                      + c.max_par_workers * c.work_mem_mb
+                      + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
+                      + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0))))
+      OR (c.role LIKE 'worker%' AND :worker_ram_mb::numeric < (
+          c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+          + c.av_workers * c.maint_mem_mb + (:burst_maint_ops)::numeric*c.maint_mem_mb
+          + c.max_par_workers * c.work_mem_mb
           + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
-          + c.cx_outbound_mb))
+          + c.cx_outbound_mb
+          + greatest(:os_reserve_mb::numeric,
+                     (c.shbuf_mb + c.max_conn * c.per_backend_peak_mb
+                      + c.av_workers * c.maint_mem_mb
+                      + (:burst_maint_ops)::numeric*c.maint_mem_mb
+                      + c.max_par_workers * c.work_mem_mb
+                      + c.wal_buffers_mb + c.temp_buffers_mb * c.max_conn * 0.25
+                      + c.cx_outbound_mb) * (:os_reserve_pct::numeric / 100.0))))
       THEN 'WARN'
     ELSE 'OK'
   END AS sev
