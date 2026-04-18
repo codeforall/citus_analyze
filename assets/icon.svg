@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img"
+     aria-label="citus_analyze logo">
+  <title>citus_analyze</title>
+  <desc>A hexagonal mesh of nodes (Citus distribution) with a heartbeat
+        line (monitoring) and an alert spark (alerting).</desc>
+
+  <defs>
+    <linearGradient id="ca-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#1f2a44"/>
+      <stop offset="100%" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="ca-hub" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#5b8fc4"/>
+      <stop offset="100%" stop-color="#336791"/>
+    </linearGradient>
+    <radialGradient id="ca-alert" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#fcd34d"/>
+      <stop offset="60%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#d97706" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- rounded-square plate -->
+  <rect x="2" y="2" width="60" height="60" rx="13" ry="13"
+        fill="url(#ca-bg)"/>
+
+  <!-- hexagonal mesh: 6 outer nodes around 1 hub -->
+  <g stroke="#4f46e5" stroke-width="1.4" stroke-linecap="round"
+     stroke-opacity="0.85" fill="none">
+    <line x1="32" y1="32" x2="32" y2="13"/>
+    <line x1="32" y1="32" x2="48.5" y2="22.5"/>
+    <line x1="32" y1="32" x2="48.5" y2="41.5"/>
+    <line x1="32" y1="32" x2="32"   y2="51"/>
+    <line x1="32" y1="32" x2="15.5" y2="41.5"/>
+    <line x1="32" y1="32" x2="15.5" y2="22.5"/>
+  </g>
+
+  <!-- 6 outer nodes (indigo) -->
+  <g fill="#6366f1" stroke="#1e1b4b" stroke-width="0.6">
+    <circle cx="32"   cy="13"   r="3.2"/>
+    <circle cx="48.5" cy="22.5" r="3.2"/>
+    <circle cx="48.5" cy="41.5" r="3.2"/>
+    <circle cx="32"   cy="51"   r="3.2"/>
+    <circle cx="15.5" cy="41.5" r="3.2"/>
+    <circle cx="15.5" cy="22.5" r="3.2"/>
+  </g>
+
+  <!-- central hub (PostgreSQL blue) -->
+  <circle cx="32" cy="32" r="7.5" fill="url(#ca-hub)"
+          stroke="#0b1120" stroke-width="0.8"/>
+
+  <!-- heartbeat / EKG pulse across the hub (monitoring) -->
+  <path d="M6 32 H22 l2 -7 3 14 3 -10 2 6 H58"
+        fill="none" stroke="#10b981" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round"
+        stroke-opacity="0.95"/>
+
+  <!-- alert spark (top-right node) -->
+  <circle cx="48.5" cy="22.5" r="6.5" fill="url(#ca-alert)"
+          opacity="0.55"/>
+  <circle cx="48.5" cy="22.5" r="2.2" fill="#fbbf24"
+          stroke="#7c2d12" stroke-width="0.6"/>
+</svg>

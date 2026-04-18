@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" role="img"
+     aria-label="citus_analyze">
+  <title>citus_analyze</title>
+
+  <defs>
+    <linearGradient id="lm-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#1f2a44"/>
+      <stop offset="100%" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="lm-hub" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#5b8fc4"/>
+      <stop offset="100%" stop-color="#336791"/>
+    </linearGradient>
+    <radialGradient id="lm-alert" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#fcd34d"/>
+      <stop offset="60%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#d97706" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- icon mark (left) -->
+  <g transform="translate(8 8)">
+    <rect x="0" y="0" width="64" height="64" rx="13" ry="13"
+          fill="url(#lm-bg)"/>
+
+    <g stroke="#4f46e5" stroke-width="1.4" stroke-linecap="round"
+       stroke-opacity="0.85" fill="none">
+      <line x1="32" y1="32" x2="32"   y2="13"/>
+      <line x1="32" y1="32" x2="48.5" y2="22.5"/>
+      <line x1="32" y1="32" x2="48.5" y2="41.5"/>
+      <line x1="32" y1="32" x2="32"   y2="51"/>
+      <line x1="32" y1="32" x2="15.5" y2="41.5"/>
+      <line x1="32" y1="32" x2="15.5" y2="22.5"/>
+    </g>
+
+    <g fill="#6366f1" stroke="#1e1b4b" stroke-width="0.6">
+      <circle cx="32"   cy="13"   r="3.2"/>
+      <circle cx="48.5" cy="22.5" r="3.2"/>
+      <circle cx="48.5" cy="41.5" r="3.2"/>
+      <circle cx="32"   cy="51"   r="3.2"/>
+      <circle cx="15.5" cy="41.5" r="3.2"/>
+      <circle cx="15.5" cy="22.5" r="3.2"/>
+    </g>
+
+    <circle cx="32" cy="32" r="7.5" fill="url(#lm-hub)"
+            stroke="#0b1120" stroke-width="0.8"/>
+
+    <path d="M4 32 H22 l2 -7 3 14 3 -10 2 6 H60"
+          fill="none" stroke="#10b981" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round"
+          stroke-opacity="0.95"/>
+
+    <circle cx="48.5" cy="22.5" r="6.5" fill="url(#lm-alert)"
+            opacity="0.55"/>
+    <circle cx="48.5" cy="22.5" r="2.2" fill="#fbbf24"
+            stroke="#7c2d12" stroke-width="0.6"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+     font-weight="700">
+    <text x="88" y="46" font-size="26" fill="#0f172a">citus_</text>
+    <text x="174" y="46" font-size="26" fill="#4f46e5">analyze</text>
+    <text x="88" y="64" font-size="10.5" fill="#475569"
+          font-family="system-ui, -apple-system, Segoe UI, sans-serif"
+          font-weight="500" letter-spacing="0.6">
+      health · sizing · capacity for Citus
+    </text>
+  </g>
+</svg>

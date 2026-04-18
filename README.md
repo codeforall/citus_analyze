@@ -1,86 +1,112 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="citus_analyze" width="320"/>
+
 # citus_analyze
 
-A [`pg_gather`](https://github.com/codeforall/pg_gather)-style **one-stop
-health, sizing, and capacity-planning utility for [Citus](https://github.com/citusdata/citus)
-clusters**.
+**Health, sizing, and capacity-planning utility for Citus distributed PostgreSQL clusters**
 
-Run a single script against the coordinator and get:
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12--17-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Citus](https://img.shields.io/badge/Citus-10--13-336791?logo=postgresql&logoColor=white)](https://github.com/citusdata/citus)
+[![Bash](https://img.shields.io/badge/Bash-4%2B-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![Zero install](https://img.shields.io/badge/install-zero--config-4f46e5)](#quick-start)
+[![Output](https://img.shields.io/badge/output-text%20%7C%20HTML%20%7C%20PDF-059669)](#output-formats)
 
-1. A **cluster snapshot bundle** (`gather.out`) — CSV-sectioned dump of every
-   catalog, GUC, background job, prepared xact, and activity view an analyst
-   needs to triage a cluster offline (pg_gather-style).
-2. A set of **quantitative advisors** that produce concrete numbers and
-   remediation SQL — not just flags. Each advisor emits a traffic-light
-   verdict (`OK` / `WARN` / `CRITICAL`).
-3. An **executive summary** with a badge-panel of every advisor's headline
-   and a single cluster-wide verdict.
+[Quick start](#quick-start) •
+[What it diagnoses](#what-it-diagnoses) •
+[HTML report](#the-html-report) •
+[Advisors](#advisor-catalogue) •
+[Driver flags](#driver-flags--exit-codes)
 
-The script exits `0` if everything is OK, `1` if any advisor is WARN, and
-`2` if any advisor is CRITICAL — so it drops straight into CI/monitoring.
-
----
-
-## Why
-
-The Citus support inbox repeatedly sees the same failure modes: OOM after
-raising shard or partition count; lock-slot exhaustion after `citus_add_node`
-on a populated cluster; connection-storm meltdowns when MX workers start
-taking traffic; stuck rebalance jobs; orphan 2PC records; "hot-tenant" shard
-skew that no one notices until queries fall off a cliff. Each of these has
-a *closed-form capacity model* that Citus itself doesn't surface. This tool
-bakes those models into a runnable sketch so you can answer, before pushing
-to prod, questions like:
-
-- "If I go from 64 to 256 shards, how much more RAM and how many more lock
-  slots do I actually need on every worker?"
-- "How many concurrent external client sessions can this cluster really
-  take today — before `citus.max_shared_pool_size` or worker
-  `max_connections` starts rejecting?"
-- "I'm about to `citus_add_node` this 3-year-old cluster. Will the metadata
-  sync actually finish, or is it going to OOM / hit `node_connection_timeout`
-  / exhaust `max_locks_per_transaction` on the new node?"
-- "Where is my data-skew hot spot right now, and what's the exact SQL to
-  isolate that tenant?"
-- "Is any 2PC record stuck such that the maintenance daemon won't clean it?"
+</div>
 
 ---
 
-## Layout
+Run one script against the coordinator and, in under a minute, get a
+complete picture of cluster health — a snapshot of every catalog that
+matters, 25 quantitative advisors that compute concrete numbers and
+recommended actions, a traffic-light executive summary on stdout, and
+(optionally) a self-contained HTML or PDF report you can share.
 
-```
-citus_analyze/
-├── citus_analyze.sh         # driver (bash; needs libpq/psql)
-├── citus_gather.sql         # collector — 31 CSV-with-header sections
-├── advisors/
-│   ├── gr1_shard_growth_advisor.sql       GR1 — memory & lock budget for shard/partition growth
-│   ├── c3_max_external_connections.sql    C3  — max safe external sessions (MX-aware)
-│   ├── s3_data_skew_advisor.sql           S3  — per-colocation / per-table / per-worker skew
-│   ├── r1_rebalance_health.sql            R1  — rebalance & background-job health
-│   ├── n6_metadata_sync_feasibility.sql   N6  — can citus_add_node actually succeed?
-│   └── a3_2pc_backlog_advisor.sql         A3  — 2PC backlog & orphan prepared xacts
-└── README.md
+```bash
+./bin/citus_analyze -h coord.example.com -d citus -f html
+# -> reports/<run>/report.html    (plus per-advisor .out files)
 ```
 
-Each advisor is a **self-contained `psql` script**. You can run any one of
-them on its own against a coordinator — no setup, no extensions to install,
-no schema to create. Inputs are overridable via `-v key=value`.
+`citus_analyze` is a **read-only, zero-install** diagnostic tool. It
+needs nothing on the server side — no extensions, no schema, no agents.
+Everything is a plain SQL script or Python stdlib. Point it at a
+coordinator, read the output.
+
+---
+
+## Contents
+
+- [What it diagnoses](#what-it-diagnoses)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Output formats](#output-formats)
+- [The HTML report](#the-html-report)
+- [Privacy & redaction](#privacy--redaction)
+- [Advisor catalogue](#advisor-catalogue)
+- [Highlighted diagnostics](#highlighted-diagnostics)
+- [Running advisors standalone](#running-advisors-standalone)
+- [The collector (`sql/gather.sql`)](#the-collector-sqlgathersql)
+- [Driver flags & exit codes](#driver-flags--exit-codes)
+- [Repository layout](#repository-layout)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## What it diagnoses
+
+Each advisor is a closed-form model, not a flag. You get a number, a
+threshold, and the exact SQL or config change to apply.
+
+| Capability | What you learn |
+|---|---|
+| **Memory sizing** | The *minimum* and *recommended* RAM for the coordinator and every worker, accounting for shard count, partition count, MX caching, and peak query multipliers. Pass measured RAM for a pass/fail verdict. |
+| **Growth planning** | Before you raise shard or partition count, see exactly how many MB of RAM and how many lock-table slots each worker would fall short by. Turns "will this scale?" into a number. |
+| **Connection capacity** | The maximum external client sessions the cluster can safely serve — jointly modelling coordinator/worker `max_connections`, `citus.max_shared_pool_size`, per-target fan-in, and pgbouncer pool sizing. |
+| **Data skew** | Hot-shard and hot-worker detection across every colocation group, with the exact `SELECT` against `citus_shards` that identifies the offending tenant or key. |
+| **Partition hygiene** | Days of future partitions on every time-partitioned table, time-bomb partitions (wrong direction, missing default), and the `create_time_partitions()` call to catch up. |
+| **Add-node feasibility** | Before `citus_add_node`, predicts metadata payload size, lock-slot demand on the new node, transactional vs non-transactional mode choice, and whether it will fit within `citus.node_connection_timeout`. |
+| **Rebalance & background jobs** | Stuck jobs, orphan background tasks, imbalanced placements, plus a preview of what the next rebalance would move. |
+| **2PC safety** | Orphan prepared transactions the coordinator has forgotten about — silent consumers of `max_prepared_transactions` slots and WAL that the Citus maintenance daemon does *not* clean. |
+| **Config audit (GUC)** | Side-by-side comparison of coordinator and worker GUCs against the Citus must-match / must-warn lists, plus PG defaults that matter for correctness (`max_prepared_transactions`, `lock_timeout`, etc.). |
+| **WAL & checkpoint pressure** | `checkpoints_req` ratios, `wal_buffers_full` counters, and recommended `max_wal_size` / `checkpoint_timeout` / `wal_buffers` targets based on observed workload. |
+| **Index health** | Per-shard aware: invalid indexes, unused distributed indexes (aggregated across every shard), duplicate indexes. |
+| **Bloat & autovacuum** | Table/index bloat estimates, autovacuum lag, stale statistics, and the exact `VACUUM (ANALYZE)` command to run. |
+| **Security** | Login roles without passwords (cross-referenced with `pg_hba` auth method so peer/trust isn't false-flagged), md5 usage, overly broad hba rules, SUPERUSER role sprawl. |
+| **Network & replication** | RTT between every node pair, slot-holding replication lag, sender status. |
+| **Disk runway** | Days until disk fill-up at the observed growth rate on every node (auto-discovered locally via `df` when possible, or pass `-v coord_disk_mb=N`). |
+| **Version & upgrade readiness** | PG and Citus version skew across nodes, pending `ALTER EXTENSION UPDATE`, pointer to the official update channel. |
+
+Each check emits one of `OK` / `INFO` / `WARN` / `CRITICAL`. The driver
+rolls the worst verdict into an exit code so `citus_analyze` drops
+straight into CI, cron, or monitoring pipelines.
 
 ---
 
 ## Requirements
 
-- PostgreSQL **12+** with Citus **10+** (tested against Citus `main`
-  on PG 17; works on Citus 11/12/13 with minor catalog differences).
-- `psql` on `PATH` (or set `PSQL_BIN=/full/path/to/psql` — useful on macOS
-  where Postgres.app / Homebrew / source builds often aren't on the
-  system `PATH`).
-- Connect as a role that can read Citus catalogs and call
-  `run_command_on_workers()`. For a hardened role, `pg_monitor` +
-  `citus_monitoring` (if present) is the minimum; a superuser is
-  sufficient everywhere. A few GUCs used by the advisors are flagged
-  `GUC_SUPERUSER_ONLY` (e.g. `citus.metadata_sync_mode`) and will
-  silently fall back to defaults for non-superusers.
-- Bash 4+, `awk`, `sed`, `grep`, `gzip` (standard on every Linux/macOS).
+- **PostgreSQL 12+** with **Citus 10+**. Tested against Citus `main` on
+  PG 17; works on Citus 11 / 12 / 13 / 15 with minor catalog differences.
+- `psql` on `PATH` (or set `PSQL_BIN=/full/path/to/psql` — useful on
+  macOS where the server build often isn't on the system `PATH`).
+- A role that can read Citus catalogs and call
+  `run_command_on_workers()`. For a hardened role, `pg_monitor` plus
+  the `citus_monitoring` grant (when available) is the minimum; a
+  superuser works everywhere.
+- Bash 4+, `awk`, `sed`, `grep`, `gzip` — standard on every Linux /
+  macOS system.
+- Python 3.8+ for the HTML renderer. **Standard library only**; no
+  `pip install` required.
+- *(Optional, for PDF export)* any one of `weasyprint`, `wkhtmltopdf`,
+  or Chrome / Chromium. Auto-detected.
 
 ---
 
@@ -90,321 +116,314 @@ no schema to create. Inputs are overridable via `-v key=value`.
 git clone https://github.com/<you>/citus_analyze.git
 cd citus_analyze
 
-# Point at your coordinator (any psql-compatible flag set works):
-./citus_analyze.sh -h coord.example.com -p 5432 -d citus -U admin
+# Point at your coordinator — any libpq flag set works:
+./bin/citus_analyze -h coord.example.com -p 5432 -d citus -U admin
 
-# or via URI:
-./citus_analyze.sh --uri "postgres://admin@coord.example.com:5432/citus"
+# ...or a libpq URI:
+./bin/citus_analyze --uri "postgres://admin@coord.example.com:5432/citus"
 
-# or via PG* env vars:
-PGHOST=coord PGDATABASE=citus ./citus_analyze.sh
+# ...or PG* env vars:
+PGHOST=coord PGDATABASE=citus ./bin/citus_analyze
 ```
 
-Output (everything lands in `./citus_analyze_<UTC-timestamp>/` by default):
+Add `--output-format` (or `-f`) to render HTML and/or PDF in the same
+run:
+
+```bash
+./bin/citus_analyze -h coord -d citus -f html        # + HTML report
+./bin/citus_analyze -h coord -d citus -f html,pdf    # + HTML + PDF
+./bin/citus_analyze -h coord -d citus -f all         # + HTML + PDF
+```
+
+You can always render an HTML report later from any existing run:
+
+```bash
+python3 lib/render_html.py reports/<run-dir>
+open    reports/<run-dir>/report.html
+```
+
+For the strongest verdicts, pass measured RAM and disk so capacity
+advisors can give you a pass/fail (they degrade to `INFO` otherwise):
+
+```bash
+./bin/citus_analyze \
+    -h coord -d citus \
+    --coord-ram-mb 16384  --worker-ram-mb 32768 \
+    --coord-disk-mb 512000 --worker-disk-mb 2048000 \
+    -f all
+```
+
+---
+
+## Output formats
+
+`--output-format` / `-f` takes a comma-separated list from
+`text | html | pdf | all`.
+
+| format | always produced | notes |
+|---|:---:|---|
+| **text**  | ✅ | executive summary on stdout + per-advisor `.out` files + `summary.txt` |
+| **html**  | opt-in | single-file self-contained report (CSS + JS + data inlined, no external assets) |
+| **pdf**   | opt-in | implies `html`; rendered via the first of `weasyprint`, `wkhtmltopdf`, `chromium`, `chrome` found on `PATH` (also detects Chrome.app / Chromium.app on macOS). If none are available, PDF is skipped with an install hint; text + HTML still succeed. |
+
+Each run lands in its own directory, so re-running against different
+clusters (or the same cluster over time) stays tidy:
 
 ```
-output directory: ./citus_analyze_20260418T005526Z
-connected OK. citus_version: Citus 12.1.x on x86_64-pc-linux-gnu ...
-running citus_gather.sql ...
-  gather OK: 31 sections,      463 lines, ~7 KB gzipped
-running advisors ...
+reports/
+├── 2026-04-18_14-28-58Z_coord.prod.example.com_5432/
+├── 2026-04-18_14-31-02Z_coord.stage.example.com_5432/
+└── 2026-04-18_15-45-10Z_coord.prod.example.com_5432/
+```
 
+Each run directory contains:
+
+| file          | contents                                            |
+|---------------|-----------------------------------------------------|
+| `gather.out`  | 31 CSV-with-header sections — the cluster snapshot  |
+| `gather.err`  | psql stderr from the collector                      |
+| `<ID>.out`    | Per-advisor full output (25 files: `M1.out`, …)     |
+| `summary.txt` | Executive summary, same text as stdout              |
+| `report.html` | Self-contained HTML report *(opt-in)*               |
+| `report.pdf`  | PDF rendering of `report.html` *(opt-in)*           |
+| `pdf.log`     | Converter stdout/stderr from the PDF step           |
+
+Sample executive summary on stdout:
+
+```text
 ============================================================
  CITUS_ANALYZE EXECUTIVE SUMMARY
 ============================================================
-  SEVERITY   ID    HEADLINE
-  ---------  ----  -------------------------------------------
-  [i] INFO     M1   Node memory minimum  -- INFO : pass --coord-ram-mb / --worker-ram-mb for pass/fail verdict. RECOMMENDED NODE RAM 3.92 GB (see M1.out).
-  [+] OK       GR1  Shard/partition growth memory model  -- OK : target is at or below current footprint.
-  [+] OK       C3   Max safe external connections (MX-aware)  -- OK : safe up to 136 concurrent external sessions under current config.
-  [X] CRITICAL S3   Data skew across shards & workers  -- CRITICAL : colocation 11 has max/avg = 128.67 (>= 5.0). Isolate hot tenant or re-pick distribution key.
-  [+] OK       R1   Rebalance / background-job health  -- OK : background-job queue is idle and clean.
-  [+] OK       N6   Metadata-sync feasibility for add-node  -- OK : payload 0.1 MB < 50 MB. Either mode works; transactional (default) is fine.
-  [+] OK       A3   2PC backlog & orphan prepared xacts  -- OK : no 2PC backlog.
+  SEVERITY      ID     HEADLINE
+  ---------     ----   -------------------------------------------
+  [i] INFO      M1     Node memory minimum (OOM-safety)             -- INFO : pass --coord-ram-mb / --worker-ram-mb for a verdict.
+  [+] OK        GR1    Shard/partition growth memory model          -- OK  : target is at or below current footprint.
+  [!] WARN      C3     Max safe external connections (MX-aware)     -- WARN: fan-out ceiling 6 clients; raise citus.max_shared_pool_size.
+  [X] CRITICAL  S3     Data skew across shards & workers            -- CRIT: colocation 11 has max/avg = 124.78 (>= 5.0). Isolate hot tenant.
+  ...
 
-  OVERALL: CRITICAL - at least one advisor returned CRITICAL.
+  OVERALL: CRITICAL
 ```
-
-Per-advisor full output lives in `./<out-dir>/{GR1,C3,S3,R1,N6,A3}.out`.
-The raw cluster snapshot is `./<out-dir>/gather.out`.
-
-### HTML report (pg_gather-style)
-
-Any run directory can be turned into a single self-contained HTML report
-with the bundled renderer:
-
-```bash
-./render_html.py ./citus_analyze_20260418T005000Z
-# -> ./citus_analyze_20260418T005000Z/report.html
-```
-
-The report includes:
-
-- **Sticky top bar** with overall-verdict chip and quick jump links.
-- **Executive summary table** with five columns: *Severity*, *ID*,
-  *Advisor*, *Current finding*, and **Minimum recommended** — the last
-  column extracts the exact target number from each advisor's output
-  (e.g. `≥ 3.92 GB per node`, `max_locks_per_transaction ≥ 320`,
-  `≤ 136 concurrent external sessions`, `shard max/avg ≤ 2.0 per
-  colocation group`).
-- **Per-advisor cards** with a structured *Finding / Recommended* block
-  plus a collapsible full raw output.
-- **Cluster snapshot** section with a live text filter over all
-  `### BEGIN:` blocks in `gather.out`, each rendered as a sortable
-  browsable table.
-- **Driver `summary.txt`** rendered verbatim.
-- **Auto dark-mode** via `prefers-color-scheme` so it reads well in both
-  light and dark terminals / viewers.
-
-No web server, no DB, no dependencies beyond Python 3 stdlib — it parses
-the `### BEGIN:` / `### END :` markers in `gather.out` and the advisor
-`*.out` files directly.
 
 ---
 
-## Driver flags
+## The HTML report
 
-```
-./citus_analyze.sh [options]
+A single self-contained `.html` file — no server, no external CSS/JS,
+no database required to view it. Open it locally, attach it to a
+ticket, or host it on any static site.
 
-  -h, --host HOST             coordinator host
-  -p, --port PORT             coordinator port
-  -d, --dbname DB             database
-  -U, --username USER         role
-      --uri URI               full libpq URI (overrides -h/-p/-d/-U)
-  -o, --out-dir DIR           output directory (default: ./citus_analyze_<ts>)
-      --psql PATH             path to psql binary (overrides PSQL_BIN env, default: psql on PATH)
-      --coord-ram-mb MB       coordinator RAM in MB (enables M1 pass/fail verdict)
-      --worker-ram-mb MB      per-worker RAM in MB  (enables M1 pass/fail verdict)
-      --gather-only           run citus_gather.sql, skip advisors
-      --advisors-only         run advisors, skip citus_gather.sql
-      --help
-```
+**What you get on first scroll:**
 
-Exit code:
-
-| code | meaning                                   |
-|------|-------------------------------------------|
-| 0    | all advisors OK                           |
-| 1    | at least one advisor returned WARN        |
-| 2    | at least one advisor returned CRITICAL, or a fatal error occurred |
+- **Sticky top bar** with the overall-verdict chip and a Print / PDF
+  action.
+- **Sticky Cluster fingerprint strip** under the top bar — a ribbon of
+  facts (database, PostgreSQL version, Citus version, node count,
+  cluster mode, distributed tables, colocation groups, total shards,
+  total data size) that stays visible while you scroll.
+- **Cluster health report (hero):**
+  - overall severity bar + traffic-light legend,
+  - **Top things to fix** — the top 5 critical/warn findings with
+    severity-tinted one-line fixes,
+  - **Recommendations needing attention** — every critical + warn
+    advisor that carries a quantitative target (e.g. `Recommended:
+    ≥ 7.60 GB per node`) in a glanceable list, colour-coded by
+    severity.
+- **Collapsible left sidebar** grouping advisors by category (Memory,
+  Connections, Data, Config, Performance, Ops, Security, Availability,
+  Upgrade). Each item shows its severity dot.
+- **Remediation playbook** — ordered list of every CRITICAL/WARN item
+  with its recommended fix, copy-to-clipboard as plain text.
+- **Filterable advisor summary** — severity chips, category chips,
+  free-text search, show/hide passing checks toggle.
+- **Per-advisor cards** — *What it checks*, *Why it matters*, *Current
+  finding*, a prominent *Recommended action* pill (the exact
+  quantitative target), and a collapsible full raw output.
+- **Cluster snapshot section** — every `### BEGIN:` block from
+  `gather.out` rendered as a browsable table with per-section CSV
+  download and a live text filter.
+- **Auto dark mode** via `prefers-color-scheme`.
+- **Print stylesheet** — detail panes auto-expand, chrome is hidden,
+  and the fingerprint strip unpins, so the report prints (or exports
+  to PDF) cleanly.
 
 ---
 
-## The advisors
+## Privacy & redaction
 
-All advisors can be run standalone:
+`sql/gather.sql` redacts query text at collection time. Single-quoted
+string literals in `pg_stat_activity.query`,
+`pg_stat_statements.query`, `citus_dist_stat_activity.query`, and
+`citus_stat_statements.query` are replaced with the token `<literal>`.
+The SQL shape is preserved (so advisors and humans can still read
+queries), but literal user data (emails, tokens, names, IDs embedded
+as strings) never reaches `gather.out`. Doubled-quote escapes (`''`)
+and `E'\\X'` escape strings are handled; dollar-quoted bodies and
+numeric literals pass through.
 
-```bash
-psql -X -f advisors/m1_node_memory_minimum.sql \
-       -v coord_ram_mb=4096 -v worker_ram_mb=8192
-psql -X -f advisors/gr1_shard_growth_advisor.sql
-psql -X -f advisors/c3_max_external_connections.sql \
-       -v headroom_pct=70 -v k_reuse=0.5 -v overhead=20
-```
+GUC sections use explicit allowlists that exclude `primary_conninfo`,
+`archive_command`, `restore_command`, and `ssl_passphrase_command`, so
+credentials never appear in the output.
 
-All of them accept `psql -v` overrides for their input assumptions (RAM per
-node, link Mbps, future shard count, connection-pool reuse factor, etc).
-Sensible defaults are picked from your live cluster.
+The HTML report carries a visible privacy banner that names the
+redaction state, so reports are self-identifying when shared.
 
-### M1 — Node memory minimum (OOM-safety)
+---
 
-**The most important advisor.** Produces a concrete minimum- and
-recommended-RAM number for each node (coordinator and every worker) so you
-can size or audit hardware without guesswork — and catches the classic
-Citus failure mode where raising shard count or partition count pushes a
-node over the edge into OOM.
+## Advisor catalogue
 
-Model:
+| ID    | Category       | Title                                               |
+|-------|----------------|-----------------------------------------------------|
+| M1    | Memory         | Node memory minimum (OOM-safety)                    |
+| GR1   | Memory         | Shard / partition growth memory model               |
+| D1    | Memory         | Disk capacity & shard-growth runway                 |
+| C3    | Connections    | Max safe external connections (MX-aware)            |
+| CP1   | Connections    | pgbouncer pool sizing                               |
+| MX1   | Connections    | MX mesh connection budget                           |
+| S3    | Data           | Data skew across shards & workers                   |
+| SC1   | Data           | Shard-count right-sizing                            |
+| REF1  | Data           | Reference-table health                              |
+| P1    | Data           | Partition hygiene & maintenance runway              |
+| P2    | Data           | Placement stats freshness                           |
+| GUC1  | Config         | Citus + PostgreSQL configuration audit              |
+| V1    | Upgrade        | Version & upgrade readiness                         |
+| Q1    | Performance    | Long-running queries & lock waits                   |
+| I1    | Performance    | Index health (per-shard aware)                      |
+| B1    | Performance    | Table bloat & autovacuum lag                        |
+| STAT1 | Performance    | Statistics freshness                                |
+| W1    | Performance    | WAL & checkpoint pressure                           |
+| R1    | Ops            | Rebalance / background-job health                   |
+| R2    | Ops            | Rebalance plan preview                              |
+| N6    | Ops            | Metadata-sync feasibility for `citus_add_node`      |
+| A3    | Ops            | 2PC backlog & orphan prepared xacts                 |
+| SEC1  | Security       | Security & role audit                               |
+| NET1  | Availability   | Node reachability & latency                         |
+| REP1  | Availability   | Streaming replication & slot lag                    |
 
-```
-  MIN RAM (steady) = shared_buffers
-                   + max_connections * per_backend_steady
-                   + autovacuum_max_workers * maintenance_work_mem
-                   + wal_buffers + temp_buffers * max_conn/4
-                   + citus_outbound_pool        (MX entry nodes only)
+---
 
-  PEAK RAM (burst) = same but per_backend peaks at
-                     (baseline + citus_meta + peak_query_mult * work_mem)
-                   + 2 * maintenance_work_mem   (CREATE INDEX, VACUUM burst)
-                   + max_parallel_workers * work_mem
+## Highlighted diagnostics
 
-  RECOMMENDED RAM  = PEAK RAM + max(1 GB, 10% OS/kernel reserve)
-```
+A few of the checks worth calling out — these are the ones that
+commonly turn "the cluster feels slow" or "the upgrade just failed"
+into a clear, actionable number.
 
-`per_backend_steady` grows with the Citus metadata cache, which scales
-with placement count. **MX entry nodes cache every placement in the
-cluster** (not just local placements) — this is why memory use balloons
-on MX clusters as you add shards. M1 captures this correctly by using
-`cached_placements` per node role.
+### M1 — Node memory minimum
 
-Pass measured RAM with `-v coord_ram_mb=N -v worker_ram_mb=N` (or via the
-driver's `--coord-ram-mb` / `--worker-ram-mb` flags) for a verdict:
-
-| verdict  | condition                                                     |
-|----------|---------------------------------------------------------------|
-| CRITICAL | measured < PEAK RAM — node **will OOM** under burst load      |
-| WARN     | measured < 1.5 × MIN RAM — no burst headroom, flappy           |
-| OK       | measured ≥ PEAK RAM                                           |
-| INFO     | measured RAM not supplied — advisory-only number printed       |
-
-Example on the current live cluster (defaults, no measured RAM):
-
-```
-MIN RAM (steady peak)       : 2028 MB  ~  1.98 GB
-PEAK RAM (worst-case burst) : 2988 MB  ~  2.92 GB
-OS/kernel reserve (added)   : 1024 MB
-RECOMMENDED NODE RAM        : 4012 MB  ~  3.92 GB
-```
-
-### GR1 — Shard / partition growth memory model
-
-Models the per-node memory and lock-slot budget *as a function of proposed
-shard count and partition count*. Answers "can I safely bump shard count
-from 32 to 256?" — and if not, by exactly how many MB of RAM and how many
-lock slots each worker would fall short.
-
-**Lock-table math** (corrected against PG `storage/lmgr/lock.c`):
-
-PostgreSQL's shared lock hash has capacity
-`max_locks_per_transaction × (MaxBackends + max_prepared_xacts)`,
-where `MaxBackends = max_connections + autovacuum_max_workers
-+ max_wal_senders + max_worker_processes`. The per-backend quota in the
-GUC name is an *average*, not a cap — a single backend can exceed it as
-long as the total hash has room. Failure (`"out of shared memory; You
-might need to increase max_locks_per_transaction"`) fires only when the
-hash cannot admit a new entry.
-
-GR1 therefore sizes by *peak cluster demand*:
+The anchor advisor. Produces a concrete **minimum** and **recommended**
+RAM number for the coordinator and each worker so you can size (or
+audit) hardware without guesswork. Correctly models MX entry nodes
+that cache every placement in the cluster, not just local ones.
 
 ```
-peak_single_backend = proposed_shards × (1 + avg_indexes_per_shard
-                                         + (write_mode ? 2 : 0))
-                      # +2 for LockShardResource + LockShardDistributionMetadata
-peak_cluster_demand = N_xshard × peak_single_backend
-                    + (max_conn - N_xshard) × ordinary_locks_per_backend
-                    × lock_safety_factor        # default 1.5
-lpt_needed = ceil(peak_cluster_demand / (MaxBackends + max_prepared_xacts) / 64) × 64
+MIN RAM   = shared_buffers + max_conn × per_backend_steady
+          + autovacuum_max_workers × maintenance_work_mem
+          + wal_buffers + citus_outbound_pool (MX only)
+
+PEAK RAM  = MIN RAM but per_backend peaks at
+            (baseline + citus_meta + peak_query_mult × work_mem)
+          + 2 × maintenance_work_mem (VACUUM / CREATE INDEX burst)
+          + excess global parallel-worker pool (when max_parallel_workers
+            exceeds what backends already reserve)
+
+RECOMMENDED = PEAK RAM + max(1 GB, 10% OS reserve)
 ```
 
-Tunable knobs (via `-v`):
-`avg_indexes_per_shard` (auto-detected from `pg_index`),
-`fraction_cross_shard` (default 0.10),
-`ordinary_locks_per_backend` (default 10),
-`lock_safety_factor` (default 1.5),
-`write_mode` (default 1).
+Pass observed RAM with `--coord-ram-mb` / `--worker-ram-mb` (or via
+`-v coord_ram_mb=N -v worker_ram_mb=N` when running the advisor
+standalone) for a hard pass/fail verdict.
 
-Flags CRITICAL when:
-- `lpt_needed > 2000` (unworkable max_locks_per_transaction)
-- predicted lock-table shared memory delta exceeds 512 MB
-- predicted worst-case backend RSS exceeds 2 GB
+### GR1 — Shard / partition growth
 
-Reports the single number every field engineer actually needs:
-**minimum safe `max_locks_per_transaction`** (rounded up to the nearest 64).
+Answers "can I bump shard count from 32 to 256?" — and if not, by
+exactly how many MB of RAM and how many lock-table slots each worker
+would fall short. Uses the correct PostgreSQL lock-table capacity
+formula:
+
+```
+capacity = max_locks_per_transaction × (MaxBackends + max_prepared_xacts)
+```
+
+Sizes by peak cluster demand (not per-backend quota) and reports the
+minimum safe `max_locks_per_transaction`, rounded to the nearest 64.
 
 ### C3 — Max safe external connections (MX-aware)
 
-Closed-form model of the three concurrent connection constraints in a Citus
-cluster:
+Closed-form model of the three concurrent-connection constraints every
+Citus cluster faces:
 
-1. **Per-entry-node inbound cap** — bounded by entry node's `max_connections`.
-2. **Per-entry-node outbound fan-out** — bounded by
-   `citus.max_shared_pool_size` across all workers.
-3. **Per-target aggregate inbound** — every MX entry opens backend
-   connections to every other worker, so the target worker's
-   `max_connections - reserved` is *shared* across all MX entry nodes.
+1. **Per-entry-node inbound** (`max_connections`).
+2. **Per-entry-node outbound fan-out** (`citus.max_shared_pool_size`).
+3. **Per-target aggregate inbound** — a worker's free connection slots
+   are shared across **all** MX entry nodes that can drive traffic
+   into it.
 
-Correctly handles **MX mode** where any worker can be the entry point
-(uses `(n_mx - 𝟙[target∈MX])` as the fan-in denominator, not `n_mx`).
-All inputs — headroom %, connection-reuse factor, per-backend overhead —
-are `-v` overridable for sensitivity analysis.
-
-### S3 — Data skew across shards & workers
-
-Three sub-checks:
-
-- **S3a** — per-colocation group: max/avg shard-bytes ratio. ≥ 5 → CRITICAL.
-- **S3b** — per-table top-N hot shards, with emitted remediation SQL
-  (`SELECT isolate_tenant_to_new_shard(...)`).
-- **S3c** — per-worker aggregate bytes distribution.
-
-Uses the built-in `citus_shards` view — one round trip, no placement-level
-fan-out required.
-
-### R1 — Rebalance / background-job health
-
-Inspects `pg_dist_background_job.state`, `pg_dist_background_task.status`,
-and `get_rebalance_progress()`. Flags:
-
-- tasks in `error` state with `retry_count ≥ 10` → CRITICAL (will not
-  auto-retry further; needs manual intervention)
-- tasks running > 240 min → CRITICAL (likely wedged)
-- cleanup record backlog
-- jobs in `failing`/`failed` state
-
-Validated against an injected failure scenario (simulated stuck job with
-max-retry error task).
+Correctly handles MX mode with `(n_mx − 𝟙[target ∈ MX])` fan-in
+accounting, and filters out coordinators with `shouldhaveshards = false`
+from per-target aggregate math.
 
 ### N6 — Metadata-sync feasibility for `citus_add_node`
 
-This is the "will it actually work?" advisor for adding a node to an
-established cluster. Models the metadata-sync payload as 9 components
-(shell CREATEs, partition attachments, `pg_dist_*` rows, FK propagation,
-pg_dist_object, schema-sharded metadata, etc) and predicts:
+The "will it actually work?" advisor for adding a node. Models the
+metadata payload as nine components (shell table CREATEs, partition
+hierarchy, `pg_dist_*` rows, FK propagation, `pg_dist_object`,
+schema-sharded metadata, …) and predicts:
 
-- **Lock-slot demand** on the candidate — the most common Citus add-node
-  failure is `out of shared memory; raise max_locks_per_transaction`.
-  Modelled as a **single transaction on the candidate** creating every
-  shell table, every partition, and their indexes — so the peak is one
-  backend holding
-  `(dist_tables + ref_tables + partitions) × (1 + avg_indexes_per_shard)`
-  relation locks. Required capacity is compared against the candidate's
-  planned
-  `max_locks_per_transaction × (MaxBackends + max_prepared_xacts)`
-  (see PG `lock.c` `NLOCKENTS()`). Tunable via `-v candidate_max_lpt`,
-  `candidate_max_prep`, `candidate_max_conn`, `avg_indexes_per_shard`,
-  `lock_safety_factor`.
-- **Candidate backend peak memory** — flagged if > 25% of candidate RAM.
-- **Coordinator peak memory** during command-list materialisation
-  (transactional mode only).
-- **Wall-time** vs `citus.node_connection_timeout`.
+- lock-slot demand on the new node,
+- candidate backend peak memory,
+- coordinator peak memory in transactional mode,
+- wall-time vs `citus.node_connection_timeout`.
 
-Emits a mode recommendation (transactional vs nontransactional) and, if
-add-node would fail AS-IS, the exact `max_locks_per_transaction` value to
-raise to before attempting the add.
-
-Overridable inputs let you sanity-check an add-node against a *proposed*
-candidate's RAM / lock budget / timeout — not just current cluster reality.
+Emits an explicit transactional-vs-non-transactional recommendation
+and, if add-node would fail, the exact `max_locks_per_transaction`
+bump to apply first.
 
 ### A3 — 2PC backlog & orphan prepared xacts
 
 Detects prepared transactions on workers that the coordinator's
-`pg_dist_transaction` table does not know about. These are **not** picked
-up by Citus's maintenance daemon and will accumulate forever, silently
-consuming `max_prepared_transactions` slots and WAL until they break the
-cluster.
-
-For each orphan, emits the exact node-specific remediation line:
+`pg_dist_transaction` has forgotten about. These are **not** cleaned by
+Citus's maintenance daemon — they silently consume
+`max_prepared_transactions` slots and hold WAL forever. The advisor
+emits the exact per-node remediation line:
 
 ```
 On 10.0.1.7:5433 run:  ROLLBACK PREPARED 'citus_0_1234_99_...';
 ```
 
-Also flags headroom on `max_prepared_transactions` (CRITICAL at ≥ 80%
-used) and classifies per-node counts into `normal_citus / orphan_citus /
-foreign_xacts`.
+---
+
+## Running advisors standalone
+
+Every advisor is a plain `psql` script with its inputs overridable via
+`-v key=value`. Run one in isolation without the driver:
+
+```bash
+psql -X -f sql/advisors/m1_node_memory_minimum.sql \
+       -v coord_ram_mb=4096 -v worker_ram_mb=8192
+
+psql -X -f sql/advisors/gr1_shard_growth_advisor.sql \
+       -v proposed_shards=256 -v proposed_partitions=52
+
+psql -X -f sql/advisors/c3_max_external_connections.sql \
+       -v headroom_pct=70 -v k_reuse=0.5
+```
+
+See the header comment of each `sql/advisors/<id>_*.sql` file for the
+full list of `-v` overrides it supports and the verdict thresholds it
+applies.
 
 ---
 
-## The collector (`citus_gather.sql`)
+## The collector (`sql/gather.sql`)
 
-Stand-alone — runs independently of the driver:
+The collector runs independently of the driver — useful if you want to
+ship a snapshot from a locked-down environment and analyse offline:
 
 ```bash
-psql -X -A -q -f citus_gather.sql > gather.out 2>&1
+psql -X -A -q -f sql/gather.sql > gather.out 2>&1
 ```
 
-Produces 31 sections bracketed by machine-parseable markers:
+It produces 31 CSV sections bracketed by machine-parseable markers:
 
 ```
 ### BEGIN: <section_id>
@@ -412,71 +431,169 @@ Produces 31 sections bracketed by machine-parseable markers:
 ### END : <section_id>
 ```
 
-Each section can be extracted with:
+Extract one section with:
 
 ```bash
 awk '/^### BEGIN: cluster_topology$/,/^### END : cluster_topology$/' gather.out
 ```
 
-Sections include: cluster topology, `pg_dist_partition`/`shard`/
-`placement`/`object`/`colocation`/`schema`/`transaction`/`cleanup`/
-`background_job`/`background_task`, `get_rebalance_progress()`,
-`citus_shards` sizes, all `citus.*` GUCs + critical PG GUCs coordinator-
-side, per-node GUCs + prepared-xacts via `run_command_on_workers`,
-coordinator `pg_stat_activity`, `citus_dist_stat_activity`, partition
-inventory, foreign-keys on distributed tables, `pg_stat_database`,
-`pg_stat_bgwriter`, replication slots, roles, extensions, and (if
-installed) top `pg_stat_statements` / `citus_stat_statements`.
+Sections cover: cluster topology; `pg_dist_partition` / `shard` /
+`placement` / `object` / `colocation` / `schema` / `transaction` /
+`cleanup` / `background_job` / `background_task`;
+`get_rebalance_progress()`; `citus_shards` sizes; all `citus.*` GUCs
+plus critical PG GUCs on the coordinator; per-node GUCs + prepared
+xacts via `run_command_on_workers`; coordinator `pg_stat_activity`;
+`citus_dist_stat_activity`; partition inventory; foreign keys on
+distributed tables; `pg_stat_database`; `pg_stat_bgwriter`;
+replication slots; roles; extensions; and, if installed, top
+`pg_stat_statements` / `citus_stat_statements`.
 
 Optional-extension sections are guarded with existence probes so the
-script never errors on clusters that don't have them.
+collector never errors on clusters that don't have them.
 
 ---
 
-## Roadmap
+## Driver flags & exit codes
 
-The current set of six advisors is v0. Planned next tranche:
+```
+./bin/citus_analyze [options]
 
-- **M1** — coordinator RAM baseline (shared_buffers + work_mem × backends +
-  maintenance_work_mem × autovac workers + palloc overhead).
-- **W1** — worker RAM baseline, per-backend peak with colocated joins.
-- **C4/C5/C6** — client-side pool sizing recommendations, PgBouncer fit,
-  `citus.max_client_connections` tuning.
-- **G1..G3** — GUC drift detector (coord vs worker, known bad combinations).
-- **N1..N5** — node-addition preflight: extension parity, type parity,
-  role parity, `pg_dist_node` staleness, replication-slot presence.
-- **S1/S2** — row-count skew and foreign-key induced colocation constraints.
-- **R2** — rebalance strategy picker (by_shard_count vs by_disk_size vs custom).
+  -h, --host HOST             coordinator host
+  -p, --port PORT             coordinator port
+  -d, --dbname DB             database
+  -U, --username USER         role
+  -W, --password              force a password prompt up front
+                              (cached for the whole run; never re-prompted)
+  -w, --no-password           never prompt; rely on PGPASSWORD or ~/.pgpass
+                              (suitable for CI)
+      --uri URI               full libpq URI (overrides -h/-p/-d/-U)
+  -o, --out-dir DIR           output directory
+                              (default: ./reports/<ts>_<host>_<port>)
+      --psql PATH             path to psql binary (default: psql on PATH;
+                              overrides the PSQL_BIN env var)
+
+  -f, --output-format LIST    comma-separated subset of
+                              text | html | pdf | all
+                              text is always produced; pdf implies html.
+
+      --coord-ram-mb MB       coordinator RAM (enables M1 verdict)
+      --worker-ram-mb MB      per-worker RAM (enables M1 verdict)
+      --coord-disk-mb MB      coordinator data-dir size MB (enables D1)
+      --worker-disk-mb MB     per-worker  data-dir size MB (enables D1)
+                              (D1 auto-discovers via `df` on a local
+                              loopback connection — override to force
+                              a value or for remote coordinators.)
+
+      --fail-on LEVEL         threshold that makes the driver exit
+                              non-zero: none | warn (default) | critical
+
+      --gather-only           run gather.sql, skip advisors
+      --advisors-only         run advisors, skip gather.sql
+      --help
+```
+
+### Authentication
+
+`citus_analyze` honours every standard libpq mechanism — `PGHOST`,
+`PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`,
+`PGSSLMODE`, `~/.pgpass`, etc. — and never invents its own.
+
+If the server requires a password and none is cached, the driver
+prompts **once** at startup and propagates the result via `PGPASSWORD`
+to every subsequent advisor call. You will never be re-prompted
+mid-run.
+
+| Scenario                                | What to use                         |
+|-----------------------------------------|-------------------------------------|
+| Interactive run, password user          | nothing — answer the prompt         |
+| Interactive run, force a fresh password | `-W` / `--password`                 |
+| CI / scripted run                       | `PGPASSWORD=… citus_analyze … -w`   |
+| CI with stored credentials              | `~/.pgpass` + `-w`                  |
+| URI with embedded password              | `--uri "postgres://u:p@host/db"`    |
+
+```bash
+# Interactive: server requires a password — prompted once.
+./bin/citus_analyze -h coord -d citus -U admin
+
+# Force a prompt up front (ignore PGPASSWORD/.pgpass).
+./bin/citus_analyze -h coord -d citus -U admin -W
+
+# CI: never prompt; fail fast if no password is available.
+PGPASSWORD="$DB_PWD" ./bin/citus_analyze -h coord -d citus -U admin -w
+```
+
+### Exit codes
+
+| code | meaning                                                        |
+|-----:|----------------------------------------------------------------|
+| `0`  | every advisor OK (or worst severity below `--fail-on`)         |
+| `1`  | at least one advisor returned WARN (when `--fail-on warn`)     |
+| `2`  | at least one advisor returned CRITICAL, or a fatal error occurred |
+
+The default `--fail-on warn` is the right choice for CI. Use
+`--fail-on critical` if you only want to block on hard failures; use
+`--fail-on none` to always exit `0` (the text/HTML report still
+captures everything).
 
 ---
 
-## Development & contributing
+## Repository layout
 
-The advisors are intentionally **plain SQL scripts, not PL/pgSQL functions
-and not an extension**. This keeps them:
+```
+citus_analyze/
+├── README.md
+├── LICENSE
+├── assets/
+│   ├── icon.svg              # square brand mark (color)
+│   ├── logo.svg              # icon + wordmark (color)
+│   └── favicon.svg           # 32x32 favicon mark
+├── bin/
+│   └── citus_analyze         # driver (bash)
+├── lib/
+│   └── render_html.py        # HTML report generator (Python stdlib)
+├── sql/
+│   ├── gather.sql            # collector — 31 CSV sections
+│   └── advisors/             # 25 advisor .sql files
+└── reports/                  # default output directory (gitignored)
+```
 
-- runnable on *any* existing cluster without installation rights,
+Each advisor is a **self-contained `psql` script**. You can run any one
+of them standalone against a coordinator — no setup, no extensions to
+install, no schema to create.
+
+---
+
+## Contributing
+
+The advisors are deliberately **plain SQL, not PL/pgSQL functions and
+not an extension**. That keeps them:
+
+- runnable on any existing cluster without installation rights,
 - auditable by reading — no compiled code,
 - easy to override for testing (`psql -v` on every input).
 
-Convention that every advisor follows:
+Conventions every advisor follows:
 
 - `\pset pager off; \pset border 2; \pset format aligned`
-- inputs via `\if :{?var} \else \set var default \endif`
-- all per-advisor state in `CREATE TEMP TABLE _<id>` (CTEs don't persist
-  across statements)
-- top-level verdict emitted in a final `\pset tuples_only on` block in the
-  strict form `OK : …` / `WARN : …` / `CRITICAL : …` — the driver greps
-  on that form, most-severe-wins.
+- Inputs via `\if :{?var} \else \set var default \endif`
+- All per-advisor state in `CREATE TEMP TABLE _<id>` (CTEs don't
+  persist across statements).
+- Top-level verdict in a final `\pset tuples_only on` block in the
+  strict form `OK : …` / `INFO : …` / `WARN : …` / `CRITICAL : …` —
+  the driver greps on that form, most-severe-wins.
 
 If you add a new advisor:
 
-1. drop it under `advisors/`,
-2. register it in `ADVISORS=(...)` in `citus_analyze.sh`,
-3. make sure it emits at least one top-level `(OK|WARN|CRITICAL) :` line.
+1. Drop the `.sql` file under `sql/advisors/`.
+2. Register it in the `ADVISORS=(...)` array in `bin/citus_analyze`.
+3. Add metadata (category, checks, matters, fix, docs URL) to the
+   `ADVISOR_META` and `ADVISORS` tables in `lib/render_html.py` so it
+   shows up in the HTML report.
+4. Emit at least one top-level `(OK|INFO|WARN|CRITICAL) :` line so the
+   driver can surface its verdict.
 
 ---
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
