@@ -1,0 +1,47 @@
+citus_analyze run at 2026-04-18_13-14-05Z (UTC)
+output directory: /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-14-05Z_127.0.0.1_5432
+connected OK. citus_version: Citus 15.0devel on arm-apple-darwin25.4.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit gitref: main(sha: 42edfe839)
+auto-discovered coord disk (/Users/muhammadusama/work/community/installed/pg-17/data.cor): 948584 MB
+running sql/gather.sql ...
+  gather OK: 31 sections,      463 lines, ~7 KB gzipped
+running advisors ...
+
+============================================================
+ CITUS_ANALYZE EXECUTIVE SUMMARY
+============================================================
+  SEVERITY   ID    HEADLINE
+  ---------  ----  -------------------------------------------
+  [i] INFO    M1  Node memory minimum (OOM-safety)  -- INFO : provide -v coord_ram_mb=<measured RAM MB> to get a pass/fail verdict.
+  [+] OK      D1  Disk capacity & shard-growth runway  -- OK : plenty of runway under current growth rate.
+  [+] OK      Q1  Long-running queries & lock waits  -- OK : no long-running queries or idle-in-tx sessions.
+  [X] CRITICAL  GUC1  Citus + PostgreSQL configuration audit  -- CRITICAL : 0 rule violation(s); 1 must-match GUC drift(s); 0 warning(s). Must-match drift breaks parallel exec / 2PC / MX routing.
+  [+] OK      V1  Version & upgrade readiness  -- OK : no cross-node PG/Citus version drift; no pending ALTER EXTENSION UPDATE. (This check does not assess whether the cluster trails the latest upstream release; cross-reference citusdata.com/updates and postgresql.org/support/versioning for minor-version / CVE status.)
+  [!] WARN    P1  Partition hygiene & maintenance runway  -- WARN : 1 table(s) have less than 14 days of future partitions. Schedule create_time_partitions(). See P1a.
+  [+] OK      I1  Index health (per-shard aware)  -- OK : no invalid indexes, no unused distributed indexes, no duplicates.
+  [+] OK      B1  Table bloat & autovacuum lag  -- OK : no significant bloat, autovacuum keeping up, ANALYZE fresh.
+  [+] OK      CP1  pgbouncer pool sizing  -- OK : recommended pool_size range 13..16; max_client_conn = pool_size * 10. See CP1a/CP1d.
+  [+] OK      R2  Rebalance plan preview  -- OK : cluster is balanced under the default strategy; no moves planned.
+  [+] OK      REF1  Reference-table health  -- OK : 1 reference table(s), all healthy (placements complete, no drift, sizes under 100 MB/copy).
+  [!] WARN    W1  WAL & checkpoint pressure  -- WARN : 2 node(s) have wal_buffers < 16 MB AND observed wal_buffers_full pressure. See W1c.
+  [+] OK      STAT1  Statistics freshness  -- OK : statistics are fresh and consistent across shards.
+  [!] WARN    SEC1  Security & role audit  -- WARN : pg_hba rules use trust or plain password. See SEC1g.
+  [+] OK      NET1  Node reachability & latency  -- OK : 2-node mesh reachable, all RTTs under 50 ms.
+  [+] OK      REP1  Streaming replication & slot lag  -- OK : no replication senders or slots configured (no HA in this deployment).
+  [+] OK      GR1  Shard/partition growth memory model  -- OK : target is at or below current footprint.
+  [!] WARN    C3  Max safe external connections (MX-aware)  -- WARN : worst-case simultaneous fan-out ceiling is only 6 clients (sustainable: 85). If clients commonly fire multi-shard queries at the same instant, raise citus.max_shared_pool_size or lower citus.max_adaptive_executor_pool_size.
+  [X] CRITICAL  S3  Data skew across shards & workers  -- CRITICAL : colocation 11 has max/avg = 124.78 (>= 5.0). Isolate hot tenant or re-pick distribution key.
+  [+] OK      R1  Rebalance / background-job health  -- OK : background-job queue is idle and clean.
+  [+] OK      N6  Metadata-sync feasibility for add-node  -- OK : payload 0.1 MB < 50 MB. Either mode works; transactional (default) is fine.
+  [+] OK      A3  2PC backlog & orphan prepared xacts  -- OK : no 2PC backlog.
+  [i] INFO    SC1  Shard-count right-sizing  -- INFO : 1 colocation group(s) at a non-ideal shard count but within tolerance; review SC1a.
+  [!] WARN    P2  Placement stats freshness  -- WARN : 66 placement(s) report shardlength=0 while data is on disk. Rebalancer cost model is wrong; refresh with citus_update_table_statistics() before the next rebalance.
+  [+] OK      MX1  MX mesh connection budget  -- OK : every MX node has headroom for client connections after accounting for mesh fan-in.
+
+  OVERALL: CRITICAL - at least one advisor returned CRITICAL.
+  Full per-advisor output: /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-14-05Z_127.0.0.1_5432/{M1,D1,Q1,GUC1,V1,P1,I1,B1,CP1,R2,REF1,W1,STAT1,SEC1,NET1,REP1,GR1,C3,S3,R1,N6,A3,SC1,P2,MX1}.out
+  Raw cluster snapshot:    /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-14-05Z_127.0.0.1_5432/gather.out
+
+
+rendering additional formats ...
+wrote /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-14-05Z_127.0.0.1_5432/report.html (390 KB)
+  HTML report: /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-14-05Z_127.0.0.1_5432/report.html

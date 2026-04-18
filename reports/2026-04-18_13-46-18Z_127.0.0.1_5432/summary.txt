@@ -1,0 +1,4 @@
+citus_analyze run at 2026-04-18_13-46-18Z (UTC)
+output directory: /Users/muhammadusama/work/Pet/citus_analyze/reports/2026-04-18_13-46-18Z_127.0.0.1_5432
+ERROR: cannot connect or Citus not installed. See preflight.err.
+psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  role "nopass_user" does not exist

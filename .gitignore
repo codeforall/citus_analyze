@@ -1,0 +1,7 @@
+# citus_analyze output
+citus_analyze_*/
+*.out
+*.err
+
+# macOS
+.DS_Store
