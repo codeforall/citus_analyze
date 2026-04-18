@@ -52,6 +52,7 @@
 DROP TABLE IF EXISTS _c3_nodes;
 CREATE TEMP TABLE _c3_nodes (
     nodename text, nodeport int, is_coord boolean, is_mx boolean,
+    is_shard_target boolean,
     max_connections int, max_shared_pool int, max_adaptive int,
     local_shared_pool int, inbound_budget int, outbound_budget int
 );
@@ -62,6 +63,7 @@ SELECT
     n.nodename, n.nodeport,
     true                                                       AS is_coord,
     n.hasmetadata                                              AS is_mx,
+    n.shouldhaveshards                                         AS is_shard_target,
     current_setting('max_connections')::int                    AS max_connections,
     CASE WHEN current_setting('citus.max_shared_pool_size')::int = -1
          THEN current_setting('max_connections')::int
@@ -81,6 +83,8 @@ SELECT
     r.nodename, r.nodeport, false,
     (SELECT hasmetadata FROM pg_dist_node dn
        WHERE dn.nodename=r.nodename AND dn.nodeport=r.nodeport),
+    (SELECT shouldhaveshards FROM pg_dist_node dn
+       WHERE dn.nodename=r.nodename AND dn.nodeport=r.nodeport)   AS is_shard_target,
     (regexp_match(r.result, 'mc=([0-9-]+)'))[1]::int              AS max_connections,
     CASE WHEN (regexp_match(r.result, 'sp=([0-9-]+)'))[1]::int = -1
          THEN (regexp_match(r.result, 'mc=([0-9-]+)'))[1]::int
@@ -129,7 +133,10 @@ per_entry AS (
              ELSE NULL END AS cap_from_outbound
     FROM _c3_nodes n, sizes s
 ),
--- per-target-worker inbound aggregation
+-- per-target-worker inbound aggregation (only nodes that actually receive
+-- shard traffic, i.e. shouldhaveshards=true). A coord with no shards is
+-- never a Citus-internal shard-query target, so including it here makes
+-- the aggregate-inbound cap artificially low and mislabels the bottleneck.
 per_target AS (
     SELECT n.nodename, n.nodeport, n.is_coord, n.is_mx,
            n.inbound_budget, s.n_mx, s.n_workers, s.k_reuse, s.safety,
@@ -155,6 +162,7 @@ per_target AS (
              ELSE NULL
            END AS cap_from_combined_inbound
     FROM _c3_nodes n, sizes s
+    WHERE n.is_shard_target
 )
 SELECT
     (SELECT min(LEAST(cap_from_inbound, cap_from_outbound))
@@ -229,7 +237,7 @@ FROM (
 ORDER BY cap_S;
 
 \echo
-\echo '-- Per-target aggregate inbound caps (ALL MX entries share load onto this target) --'
+\echo '-- Per-target aggregate inbound caps (ALL MX entries share load onto this target; shard-holding nodes only) --'
 SELECT
     nodename AS node, nodeport AS port,
     CASE WHEN is_coord THEN 'coord' ELSE 'worker' END AS role,
@@ -252,6 +260,7 @@ FROM (
          (SELECT (SELECT count(*) FROM _c3_nodes WHERE is_mx) n_mx,
                  :k_reuse::numeric k_reuse,
                  :headroom_pct::numeric/100.0 safety) s
+    WHERE n.is_shard_target
 ) y
 ORDER BY cap_S_aggregate;
 
@@ -277,19 +286,61 @@ SELECT format('   - Combined ext+int cap  : %s  (%s)',
               COALESCE(combined_bottleneck_label, 'no MX nodes serving as shard targets'))
 FROM _c3_summary;
 
+-- --------------------------------------------------------------------
+-- Pessimistic worst-case simultaneous fan-out ceiling.
+-- If every external client fires a multi-shard query at the same
+-- instant, each client consumes `max_adaptive_executor_pool_size`
+-- internal connections. Total internal connections are bounded by
+-- `max_shared_pool_size` per MX node. Dividing gives the absolute
+-- ceiling on how many clients can be *in the middle of a fan-out*
+-- concurrently (regardless of how many idle sessions the cluster
+-- can hold). This is a STRICT lower bound on C3's sustainable cap.
+--
+-- The sustainable cap above assumes K_reuse < 1 (not every client
+-- fans out every instant); the two numbers together frame the
+-- operating envelope.
+-- --------------------------------------------------------------------
+DROP TABLE IF EXISTS _c3_worst;
+CREATE TEMP TABLE _c3_worst AS
+SELECT
+  (SELECT min(
+    GREATEST(1,
+      floor(n.max_shared_pool::numeric
+            / NULLIF((SELECT setting::int FROM pg_settings
+                       WHERE name='citus.max_adaptive_executor_pool_size'),
+                     0))::int
+    ))
+     FROM _c3_nodes n WHERE n.is_mx)                        AS worst_fanout_per_node,
+  (SELECT setting::int FROM pg_settings
+     WHERE name='citus.max_adaptive_executor_pool_size')    AS adaptive_pool,
+  (SELECT min(n.max_shared_pool) FROM _c3_nodes n WHERE n.is_mx) AS min_shared_pool;
+
+SELECT format('   - Worst-case fanout cap : %s  (max_shared_pool_size / max_adaptive_executor_pool_size on the tightest MX node; simultaneous multi-shard fan-outs)',
+              COALESCE(worst_fanout_per_node, 0))
+FROM _c3_worst;
+SELECT format('     |-- formula          : floor(%s / %s) = %s',
+              min_shared_pool, adaptive_pool, COALESCE(worst_fanout_per_node, 0))
+FROM _c3_worst;
+
 SELECT
   CASE
     WHEN LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)) <= 0
       THEN 'CRITICAL : no headroom. Raise max_connections or max_shared_pool_size before accepting external traffic.'
+    WHEN (SELECT worst_fanout_per_node FROM _c3_worst) < 10
+      THEN format('WARN : worst-case simultaneous fan-out ceiling is only %s clients (sustainable: %s). If clients commonly fire multi-shard queries at the same instant, raise citus.max_shared_pool_size or lower citus.max_adaptive_executor_pool_size.',
+                  COALESCE((SELECT worst_fanout_per_node FROM _c3_worst), 0),
+                  LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)))
     WHEN LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)) < 50
       THEN format('WARN : only %s concurrent external sessions safe. Consider pooling (pgbouncer) in front of entry points.',
                   LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)))
-    ELSE format('OK : safe up to %s concurrent external sessions under current config.',
-                  LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)))
+    ELSE format('OK : safe up to %s concurrent external sessions (worst-case simultaneous fan-out ceiling: %s).',
+                  LEAST(cap_entry_min, cap_target_min, COALESCE(cap_combined_min, 2147483647)),
+                  COALESCE((SELECT worst_fanout_per_node FROM _c3_worst), 0))
   END
 FROM _c3_summary;
 
 \pset tuples_only off
 
+DROP TABLE _c3_worst;
 DROP TABLE _c3_nodes;
 DROP TABLE _c3_summary;

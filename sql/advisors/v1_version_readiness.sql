@@ -340,7 +340,7 @@ SELECT CASE
   WHEN upgradeable_n > 0 THEN
     format('INFO : %s node(s) could upgrade Citus to a newer available version. See V1c.',
            upgradeable_n)
-  ELSE 'OK : all nodes on matching PG major and Citus versions, no pending upgrades.'
+  ELSE 'OK : no cross-node PG/Citus version drift; no pending ALTER EXTENSION UPDATE. (This check does not assess whether the cluster trails the latest upstream release; cross-reference citusdata.com/updates and postgresql.org/support/versioning for minor-version / CVE status.)'
 END
 FROM sig;
 \pset tuples_only off

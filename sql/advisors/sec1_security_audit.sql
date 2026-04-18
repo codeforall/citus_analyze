@@ -80,6 +80,14 @@ FROM run_command_on_all_nodes($CMD$
       WHERE auth_method IN ('trust','password')
          OR (type='host' AND auth_method NOT IN ('scram-sha-256','cert','peer','reject'))
     ),
+    'hba_nonpw_methods', (
+      -- Methods that do NOT require a database-stored password hash.
+      -- Used by SEC1b to suppress false-positive "login role without
+      -- password" warnings when pg_hba authenticates via OS/identity.
+      SELECT jsonb_agg(DISTINCT auth_method)
+      FROM pg_hba_file_rules
+      WHERE auth_method IN ('peer','trust','cert','ident','gss','sspi')
+    ),
     'pub_grants', (
       SELECT jsonb_agg(jsonb_build_object(
         'schema', n.nspname,
@@ -159,6 +167,18 @@ LIMIT :top_n;
 -- ---------------------------------------------------------------------
 \echo
 \echo '-- SEC1b. Password hash method distribution per role --'
+-- A role with no database-stored password is only problematic when the
+-- cluster's pg_hba requires a password hash (scram/md5). If pg_hba routes
+-- authentication through non-password methods (peer/trust/cert/ident/
+-- gss/sspi), the absence of rolpassword is by design.
+WITH hba_nonpw AS (
+  SELECT bool_or(
+           (s.p ? 'hba_nonpw_methods')
+           AND jsonb_typeof(s.p->'hba_nonpw_methods') = 'array'
+           AND jsonb_array_length(s.p->'hba_nonpw_methods') > 0
+         ) AS has_nonpw_auth
+  FROM _sec1 s
+)
 SELECT
   rolname,
   string_agg(DISTINCT pwd_method, ', ') AS methods_seen,
@@ -169,6 +189,9 @@ SELECT
       THEN 'WARN: password hash differs across nodes'
     WHEN 'md5' = ANY(array_agg(DISTINCT pwd_method))
       THEN 'WARN: md5 is deprecated -- re-set password to upgrade to scram-sha-256'
+    WHEN 'none' = ANY(array_agg(DISTINCT pwd_method)) AND bool_or(rolcanlogin)
+         AND (SELECT has_nonpw_auth FROM hba_nonpw)
+      THEN 'INFO: login role has no password hash; pg_hba uses non-password auth (peer/trust/cert/ident) -- confirm this role is authorised via that path'
     WHEN 'none' = ANY(array_agg(DISTINCT pwd_method)) AND bool_or(rolcanlogin)
       THEN 'WARN: login role without password'
     ELSE 'ok'
@@ -356,9 +379,21 @@ SELECT (
     WHEN EXISTS (SELECT 1 FROM _sec1 WHERE p->'settings'->>'password_encryption' <> 'scram-sha-256')
       THEN 'WARN : password_encryption is not scram-sha-256 on one or more nodes.'
     WHEN EXISTS (
-      SELECT 1 FROM _sec1_roles WHERE rolcanlogin AND pwd_method IN ('md5','none')
+      SELECT 1 FROM _sec1_roles WHERE rolcanlogin AND pwd_method = 'md5'
     )
-      THEN 'WARN : login role(s) with md5 / missing password. See SEC1b.'
+      THEN 'WARN : login role(s) still using md5. See SEC1b.'
+    WHEN EXISTS (
+      SELECT 1 FROM _sec1_roles r
+      WHERE r.rolcanlogin AND r.pwd_method = 'none'
+        -- only escalate to WARN if pg_hba actually requires passwords;
+        -- otherwise SEC1b will report INFO and operator can verify.
+        AND NOT EXISTS (
+          SELECT 1 FROM _sec1 s
+          WHERE jsonb_typeof(s.p->'hba_nonpw_methods') = 'array'
+            AND jsonb_array_length(s.p->'hba_nonpw_methods') > 0
+        )
+    )
+      THEN 'WARN : login role(s) with no password hash AND pg_hba lacks peer/trust/cert/ident rules. See SEC1b.'
     WHEN EXISTS (SELECT 1 FROM _sec1_hba WHERE auth_method IN ('trust','password'))
       THEN 'WARN : pg_hba rules use trust or plain password. See SEC1g.'
     WHEN EXISTS (

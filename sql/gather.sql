@@ -30,8 +30,27 @@ SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements') AS
 SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND schemaname='public') AS have_css \gset
 
 -- ---------------------------------------------------------------------
+-- Redaction policy
+-- ----------------
+-- Query-text columns collected from pg_stat_activity / pg_stat_statements
+-- / citus_dist_stat_activity / citus_stat_statements are filtered with a
+-- regex that replaces single-quoted string literals with the token
+-- "<literal>". This preserves the SQL shape (so advisors and humans can
+-- still read the query) while eliminating literal user data such as
+-- emails, tokens, names, and IDs embedded as strings. The regex also
+-- handles doubled-quote escapes ('') and E'...'''(?:''''|\\.|[^''\\])*'''..' escape strings.
+-- Dollar-quoted bodies (used in PL/pgSQL function definitions) and
+-- numeric literals are left as-is; redact those at the source if they
+-- matter for your compliance posture.
+--
+-- Sensitive GUCs (primary_conninfo, archive_command, restore_command,
+-- ssl_passphrase_command) are never collected by this script. The GUC
+-- sections below use explicit allowlists, not wildcards.
+-- ---------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------
 \echo ### BEGIN: meta
-\copy (SELECT now() AS collected_at, current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port, current_user AS collected_by, version() AS pg_version, citus_version() AS citus_version) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT now() AS collected_at, current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port, current_user AS collected_by, version() AS pg_version, citus_version() AS citus_version, 'on' AS query_redaction) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : meta
 
 -- ---------------------------------------------------------------------
@@ -126,12 +145,12 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: pg_stat_activity_coord
-\copy (SELECT datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, state_change, backend_xmin::text, left(query, 400) AS query FROM pg_stat_activity WHERE pid <> pg_backend_pid()) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, state_change, backend_xmin::text, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM pg_stat_activity WHERE pid <> pg_backend_pid()) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : pg_stat_activity_coord
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: citus_dist_stat_activity
-\copy (SELECT global_pid, nodeid, pid, datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, left(query, 400) AS query FROM citus_dist_stat_activity) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT global_pid, nodeid, pid, datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM citus_dist_stat_activity) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : citus_dist_stat_activity
 
 -- ---------------------------------------------------------------------
@@ -173,7 +192,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 \echo ### BEGIN: pg_stat_statements_top
 \if :have_pgss
 -- Top 30 by total_exec_time
-\copy (SELECT queryid::text, calls, total_exec_time::numeric(20,2) AS total_ms, mean_exec_time::numeric(20,2) AS mean_ms, rows, shared_blks_hit, shared_blks_read, left(query, 400) AS query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT queryid::text, calls, total_exec_time::numeric(20,2) AS total_ms, mean_exec_time::numeric(20,2) AS mean_ms, rows, shared_blks_hit, shared_blks_read, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
 \else
 \echo -- skipped: pg_stat_statements extension not installed
 \endif
@@ -182,7 +201,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: citus_stat_statements_top
 \if :have_css
-\copy (SELECT queryid::text, left(query,400) AS query, executor, partition_key, calls FROM public.citus_stat_statements ORDER BY calls DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT queryid::text, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'),400) AS query, executor, partition_key, calls FROM public.citus_stat_statements ORDER BY calls DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
 \else
 \echo -- skipped: citus_stat_statements view not present (citus_stat_statements extension not installed)
 \endif

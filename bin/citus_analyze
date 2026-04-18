@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+# =====================================================================
+# citus_analyze
+# ---------------------------------------------------------------------
+# One-shot driver that (1) runs sql/gather.sql to produce a full
+# cluster snapshot bundle, and (2) runs every advisor against the live
+# coordinator, collecting traffic-light headlines and assembling an
+# executive summary.
+#
+# Usage
+#   ./bin/citus_analyze                             # uses PG* env vars
+#   ./bin/citus_analyze -h 10.0.0.1 -p 5432 -d citus -U admin
+#   ./bin/citus_analyze --uri "postgres://admin@coord:5432/citus"
+#   ./bin/citus_analyze --psql /opt/pg17/bin/psql -h coord ...
+#   ./bin/citus_analyze -o /tmp/citus_report_2025
+#   ./bin/citus_analyze --output-format html          # text + HTML in one go
+#   ./bin/citus_analyze --output-format html,pdf      # text + HTML + PDF
+#   ./bin/citus_analyze -f all                        # text + HTML + PDF
+#
+# Exit codes
+#   0  all advisors OK (or --fail-on=none / --fail-on=critical with no crit)
+#   1  at least one WARN (default exit policy)
+#   2  at least one CRITICAL (or any error)
+#
+# Exit-policy flag
+#   --fail-on warn      (default) 1 on WARN, 2 on CRITICAL
+#   --fail-on critical  exit 2 only on CRITICAL; WARN reported but not failing
+#   --fail-on none      always exit 0; CI runs never fail on findings
+#
+# Requires: psql (libpq), bash 4+, awk, sed. Read-only role is enough
+# for most checks (pg_monitor + membership in citus_monitoring role
+# recommended). Some sections need superuser; they degrade to NOTICE.
+# =====================================================================
+set -u -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SQL_DIR="$REPO_ROOT/sql"
+ADVISOR_DIR="$SQL_DIR/advisors"
+GATHER_SQL="$SQL_DIR/gather.sql"
+REPORTS_DIR_DEFAULT="$REPO_ROOT/reports"
+PSQL_BIN="${PSQL_BIN:-psql}"
+
+# -------- defaults / args ---------
+OUT_DIR=""
+URI=""
+HOSTARG=""
+PORTARG=""
+DBARG=""
+USERARG=""
+COORD_RAM_MB=""
+WORKER_RAM_MB=""
+COORD_DISK_MB=""
+WORKER_DISK_MB=""
+ADVISORS_ONLY=0
+GATHER_ONLY=0
+# fail-on controls which severity level maps to a non-zero exit code.
+# Values: critical | warn | info | none. Default keeps prior behavior:
+# exit 2 on any CRITICAL, exit 1 on any WARN, exit 0 otherwise.
+FAIL_ON="warn"
+# --output-format selects which artefacts to emit at the end of the run.
+# Value is a comma-separated list drawn from {text, html, pdf, all}.
+# text is always produced (exec summary + per-advisor .out files); this
+# flag controls the *extra* rendered artefacts layered on top. `all` is
+# shorthand for text,html,pdf.
+OUTPUT_FORMAT="text"
+# Password handling. Mirrors psql's -W / -w semantics:
+#   FORCE_PASSWORD=1  -> always prompt once at startup, regardless of
+#                        whether the server actually requires a password.
+#   NO_PASSWORD=1     -> never prompt; if the server requires one, fail
+#                        loudly. Suitable for CI (use PGPASSWORD or
+#                        ~/.pgpass instead).
+# Default (both 0): try once without a password; if the server replies
+# "no password supplied" or "password authentication failed", prompt
+# interactively and retry — matching what users expect from psql but
+# done once for the whole run so the cached PGPASSWORD is reused by
+# every advisor invocation.
+FORCE_PASSWORD=0
+NO_PASSWORD=0
+
+usage() {
+    local rc="${1:-0}"
+    cat <<'EOF'
+citus_analyze - health, sizing, and capacity-planning utility for Citus.
+
+Usage:
+  citus_analyze [CONNECTION OPTION]... [OPTION]...
+
+Connection options:
+  -h, --host=HOSTNAME      coordinator host (default: PGHOST or socket)
+  -p, --port=PORT          coordinator port (default: PGPORT or 5432)
+  -d, --dbname=DBNAME      database name    (default: PGDATABASE)
+  -U, --username=USERNAME  database role    (default: PGUSER)
+  -W, --password           force a password prompt up front (cached for
+                           the whole run; never re-prompted)
+  -w, --no-password        never prompt; rely on PGPASSWORD or ~/.pgpass.
+                           If the server needs a password and one isn't
+                           available, fail fast (suitable for CI).
+      --uri=URI            full libpq URI; overrides -h/-p/-d/-U
+      --psql=PATH          path to the psql binary
+                           (default: PSQL_BIN env var, or 'psql' on PATH)
+
+Output options:
+  -o, --out-dir=DIR        output directory for this run
+                           (default: ./reports/<timestamp>_<host>_<port>)
+  -f, --output-format=LIST comma-separated list of extra artefacts to render:
+                             text | html | pdf | all
+                           text is always produced; pdf implies html.
+                           (default: text)
+
+Capacity inputs (enable hard pass/fail verdicts):
+      --coord-ram-mb=MB    coordinator RAM in MB           (advisor M1)
+      --worker-ram-mb=MB   per-worker  RAM in MB           (advisor M1)
+      --coord-disk-mb=MB   coordinator data-dir size in MB (advisor D1)
+      --worker-disk-mb=MB  per-worker  data-dir size in MB (advisor D1)
+
+Run-scope options:
+      --gather-only        run gather.sql only; skip advisors
+      --advisors-only      run advisors only; skip gather.sql
+      --fail-on=LEVEL      severity that makes the driver exit non-zero:
+                             none | warn | critical          (default: warn)
+
+Other options:
+      --help               show this help and exit
+
+Exit codes:
+  0   no finding at or above --fail-on level
+  1   at least one WARN     (when --fail-on=warn,     the default)
+  2   at least one CRITICAL (always), or a fatal error
+
+Examples:
+  citus_analyze                                        # use PG* env vars
+  citus_analyze -h coord.example.com -d citus -U admin
+  citus_analyze -h coord -d citus -U admin -W          # prompt for password
+  PGPASSWORD=secret citus_analyze -h coord -d citus -U admin -w   # CI mode
+  citus_analyze --uri "postgres://admin:secret@coord:5432/citus"
+  citus_analyze -h coord -d citus -f html              # + HTML report
+  citus_analyze -h coord -d citus -f html,pdf          # + HTML + PDF
+  citus_analyze -h coord -d citus -f all \
+                --coord-ram-mb 16384 --worker-ram-mb 32768
+
+Environment variables:
+  All standard libpq variables are honoured: PGHOST, PGPORT, PGDATABASE,
+  PGUSER, PGPASSWORD, PGSERVICE, PGSSLMODE, ~/.pgpass, etc.
+  When the server requires password authentication and none is cached,
+  citus_analyze prompts once and reuses the value for every advisor.
+
+Report bugs at: https://github.com/<your-org>/citus_analyze/issues
+EOF
+    exit "$rc"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--host)      HOSTARG="$2"; shift 2;;
+        -p|--port)      PORTARG="$2"; shift 2;;
+        -d|--dbname)    DBARG="$2"; shift 2;;
+        -U|--username)  USERARG="$2"; shift 2;;
+        --uri)          URI="$2"; shift 2;;
+        -o|--out-dir)   OUT_DIR="$2"; shift 2;;
+        --psql)         PSQL_BIN="$2"; shift 2;;
+        --coord-ram-mb)  COORD_RAM_MB="$2"; shift 2;;
+        --worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
+        --coord-disk-mb)  COORD_DISK_MB="$2"; shift 2;;
+        --worker-disk-mb) WORKER_DISK_MB="$2"; shift 2;;
+        --advisors-only) ADVISORS_ONLY=1; shift;;
+        --gather-only)  GATHER_ONLY=1; shift;;
+        --fail-on)      FAIL_ON="$2"; shift 2;;
+        --output-format|-f) OUTPUT_FORMAT="$2"; shift 2;;
+        -W|--password)    FORCE_PASSWORD=1; shift;;
+        -w|--no-password) NO_PASSWORD=1; shift;;
+        --help)         usage 0;;
+        *)              echo "citus_analyze: unrecognized option '$1'" >&2
+                        echo "Try 'citus_analyze --help' for more information." >&2
+                        exit 2;;
+    esac
+done
+
+# -------- build psql argv ---------
+# preflight: check psql is actually reachable (after arg parsing so --psql wins)
+if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
+    echo "ERROR: psql not found: '$PSQL_BIN'" >&2
+    echo "  Pass an absolute path with --psql, e.g." >&2
+    echo "    ./citus_analyze.sh --psql /usr/lib/postgresql/17/bin/psql ..." >&2
+    echo "  or set PSQL_BIN in the environment, or add psql to your PATH." >&2
+    exit 2
+fi
+
+PSQL_ARGS=(-X -A -q -v ON_ERROR_STOP=off)
+# Make Citus shard relations visible to our pg_class-based queries.
+# (citus.override_table_visibility=on hides tenantA_102234 etc. from pg_class
+#  so tools don't drown in shard rows. We need to see them to audit them.)
+# application_name is also set for the same reason via
+# citus.show_shards_for_app_name_prefixes in case a deployment enforces it.
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c citus.override_table_visibility=off -c application_name=citus_analyze"
+if [[ -n "$URI" ]]; then
+    PSQL_ARGS+=("$URI")
+else
+    [[ -n "$HOSTARG" ]] && PSQL_ARGS+=(-h "$HOSTARG")
+    [[ -n "$PORTARG" ]] && PSQL_ARGS+=(-p "$PORTARG")
+    [[ -n "$DBARG"   ]] && PSQL_ARGS+=(-d "$DBARG")
+    [[ -n "$USERARG" ]] && PSQL_ARGS+=(-U "$USERARG")
+fi
+# Always pass -w to psql so it never tries to open /dev/tty for its
+# own prompt mid-run. We handle the prompt once, at the driver level,
+# below — and propagate the result via PGPASSWORD to every subsequent
+# psql call so the user types their password at most once per run.
+PSQL_ARGS+=(-w)
+
+# -------- password handling --------
+# prompt_for_password: read a password silently and export PGPASSWORD
+# so every subsequent psql invocation in this run reuses it. Uses
+# /dev/tty so the prompt works even when stdout is being piped.
+prompt_for_password() {
+    local who="${USERARG:-${PGUSER:-$USER}}"
+    local where
+    if [[ -n "$URI" ]]; then where="$URI"
+    else where="${HOSTARG:-${PGHOST:-localhost}}:${PORTARG:-${PGPORT:-5432}}"
+    fi
+    if [[ ! -t 0 && ! -r /dev/tty ]]; then
+        echo "ERROR: password required for role '$who' on $where, but no" >&2
+        echo "       terminal is available to prompt. Set PGPASSWORD," >&2
+        echo "       create ~/.pgpass, or pass --no-password to fail fast." >&2
+        return 1
+    fi
+    local pw=""
+    # /dev/tty makes this work in pipelines (e.g. ... | tee).
+    printf "Password for role '%s' on %s: " "$who" "$where" > /dev/tty
+    IFS= read -rs pw < /dev/tty
+    echo "" > /dev/tty
+    if [[ -z "$pw" ]]; then
+        echo "ERROR: empty password; aborting." >&2
+        return 1
+    fi
+    export PGPASSWORD="$pw"
+    return 0
+}
+
+# If the user explicitly asked for a password prompt up front (-W),
+# do it now before any psql call so all of them share PGPASSWORD.
+if [[ "$FORCE_PASSWORD" -eq 1 ]]; then
+    if [[ "$NO_PASSWORD" -eq 1 ]]; then
+        echo "ERROR: -W/--password and -w/--no-password are mutually exclusive." >&2
+        exit 2
+    fi
+    prompt_for_password || exit 2
+fi
+
+# -------- output directory ---------
+TS="$(date -u +%Y-%m-%d_%H-%M-%SZ)"
+if [[ -z "$OUT_DIR" ]]; then
+    # Friendly run name: <date>_<host>_<port> so ls sorts chronologically and
+    # multi-cluster runs stay distinguishable. Falls back to a generic tag
+    # when host/port aren't known (PG* env vars, unix socket, etc).
+    tag=""
+    if [[ -n "$HOSTARG" || -n "$PORTARG" ]]; then
+        tag="${HOSTARG:-local}_${PORTARG:-5432}"
+    elif [[ -n "${PGHOST:-}" || -n "${PGPORT:-}" ]]; then
+        tag="${PGHOST:-local}_${PGPORT:-5432}"
+    else
+        tag="cluster"
+    fi
+    # Sanitize: strip chars unsafe in paths.
+    tag="${tag//\//-}"
+    tag="${tag//:/-}"
+    mkdir -p "$REPORTS_DIR_DEFAULT"
+    OUT_DIR="$REPORTS_DIR_DEFAULT/${TS}_${tag}"
+fi
+mkdir -p "$OUT_DIR"
+
+GATHER_OUT="$OUT_DIR/gather.out"
+GATHER_ERR="$OUT_DIR/gather.err"
+SUMMARY="$OUT_DIR/summary.txt"
+
+echo "citus_analyze run at ${TS} (UTC)" > "$SUMMARY"
+echo "output directory: $OUT_DIR"      | tee -a "$SUMMARY"
+
+# -------- connectivity probe --------
+# We always pass -w to psql, so a server that needs a password and
+# doesn't have one cached (PGPASSWORD/.pgpass) will fail with one of
+# the "no password supplied" / "password authentication failed"
+# patterns. Detect that, prompt once, and retry — unless the user
+# disabled prompting with -w/--no-password.
+run_preflight() {
+    "$PSQL_BIN" "${PSQL_ARGS[@]}" -c "SELECT citus_version();" \
+        > "$OUT_DIR/preflight.out" 2> "$OUT_DIR/preflight.err"
+}
+
+if ! run_preflight; then
+    if [[ "$NO_PASSWORD" -eq 0 && "$FORCE_PASSWORD" -eq 0 ]] \
+       && grep -q -E 'no password supplied|password authentication failed|fe_sendauth' \
+                "$OUT_DIR/preflight.err"; then
+        echo "Server requires password authentication."
+        if prompt_for_password; then
+            run_preflight || {
+                echo "ERROR: authentication failed. See preflight.err." | tee -a "$SUMMARY"
+                cat "$OUT_DIR/preflight.err" | tee -a "$SUMMARY" >&2
+                exit 2
+            }
+        else
+            exit 2
+        fi
+    else
+        echo "ERROR: cannot connect or Citus not installed. See preflight.err." | tee -a "$SUMMARY"
+        cat "$OUT_DIR/preflight.err" | tee -a "$SUMMARY" >&2
+        exit 2
+    fi
+fi
+CITUS_VER="$(sed -n '2p' "$OUT_DIR/preflight.out" | tr -d '\r' | awk '{$1=$1; print}')"
+echo "connected OK. citus_version: ${CITUS_VER}" | tee -a "$SUMMARY"
+
+# Auto-discover coord disk MB if running against a local coordinator and
+# the user didn't pass --coord-disk-mb. We can only reliably probe the
+# local filesystem, so worker disk still needs an explicit --worker-disk-mb.
+if [[ -z "$COORD_DISK_MB" ]]; then
+    is_local=0
+    case "${HOSTARG:-${PGHOST:-}}" in
+        ""|localhost|127.0.0.1|::1|/*) is_local=1;;
+    esac
+    if (( is_local )); then
+        if DATA_DIR="$("$PSQL_BIN" "${PSQL_ARGS[@]}" -Atc 'show data_directory' 2>/dev/null)" \
+           && [[ -n "$DATA_DIR" && -d "$DATA_DIR" ]]; then
+            if DISK_MB="$(df -Pm "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $2}')" \
+               && [[ "$DISK_MB" =~ ^[0-9]+$ ]]; then
+                COORD_DISK_MB="$DISK_MB"
+                echo "auto-discovered coord disk (${DATA_DIR}): ${COORD_DISK_MB} MB" | tee -a "$SUMMARY"
+            fi
+        fi
+    fi
+fi
+
+# =====================================================================
+# Step 1: collector
+# =====================================================================
+if [[ "$ADVISORS_ONLY" -eq 0 ]]; then
+    echo "running sql/gather.sql ..." | tee -a "$SUMMARY"
+    if ! "$PSQL_BIN" "${PSQL_ARGS[@]}" -f "$GATHER_SQL" > "$GATHER_OUT" 2> "$GATHER_ERR"; then
+        echo "WARN : sql/gather.sql returned non-zero; partial output may still be usable" | tee -a "$SUMMARY"
+    fi
+    SECTIONS=$(grep -c '^### BEGIN:' "$GATHER_OUT" || echo 0)
+    GZ_SIZE=$(gzip -c "$GATHER_OUT" | wc -c)
+    echo "  gather OK: $SECTIONS sections, $(wc -l < "$GATHER_OUT") lines, ~$((GZ_SIZE/1024)) KB gzipped" | tee -a "$SUMMARY"
+fi
+
+if [[ "$GATHER_ONLY" -eq 1 ]]; then
+    exit 0
+fi
+
+# =====================================================================
+# Step 2: advisors
+# =====================================================================
+# each entry: "id:title:file"
+ADVISORS=(
+  "M1:Node memory minimum (OOM-safety):m1_node_memory_minimum.sql"
+  "D1:Disk capacity & shard-growth runway:d1_disk_capacity_runway.sql"
+  "Q1:Long-running queries & lock waits:q1_long_running_queries.sql"
+  "GUC1:Citus + PostgreSQL configuration audit:guc1_config_audit.sql"
+  "V1:Version & upgrade readiness:v1_version_readiness.sql"
+  "P1:Partition hygiene & maintenance runway:p1_partition_hygiene.sql"
+  "I1:Index health (per-shard aware):i1_index_health.sql"
+  "B1:Table bloat & autovacuum lag:b1_bloat_autovacuum.sql"
+  "CP1:pgbouncer pool sizing:cp1_pgbouncer_pool.sql"
+  "R2:Rebalance plan preview:r2_rebalance_preview.sql"
+  "REF1:Reference-table health:ref1_reference_table_health.sql"
+  "W1:WAL & checkpoint pressure:w1_wal_checkpoint.sql"
+  "STAT1:Statistics freshness:stat1_stats_freshness.sql"
+  "SEC1:Security & role audit:sec1_security_audit.sql"
+  "NET1:Node reachability & latency:net1_node_reachability.sql"
+  "REP1:Streaming replication & slot lag:rep1_replication_lag.sql"
+  "GR1:Shard/partition growth memory model:gr1_shard_growth_advisor.sql"
+  "C3:Max safe external connections (MX-aware):c3_max_external_connections.sql"
+  "S3:Data skew across shards & workers:s3_data_skew_advisor.sql"
+  "R1:Rebalance / background-job health:r1_rebalance_health.sql"
+  "N6:Metadata-sync feasibility for add-node:n6_metadata_sync_feasibility.sql"
+  "A3:2PC backlog & orphan prepared xacts:a3_2pc_backlog_advisor.sql"
+  "SC1:Shard-count right-sizing:sc1_shard_count_sizing.sql"
+  "P2:Placement stats freshness:p2_placement_freshness.sql"
+  "MX1:MX mesh connection budget:mx1_mesh_connection_budget.sql"
+)
+
+WORST=0   # 0=OK 1=WARN 2=CRITICAL
+
+declare -a HEADLINES
+
+run_advisor() {
+    local id="$1" title="$2" file="$3"
+    local path="$ADVISOR_DIR/$file"
+    local out="$OUT_DIR/${id}.out"
+    local err="$OUT_DIR/${id}.err"
+    if [[ ! -r "$path" ]]; then
+        HEADLINES+=("? ${id}  ${title}  -- advisor file missing: $file")
+        return
+    fi
+    "$PSQL_BIN" "${PSQL_ARGS[@]}" \
+        ${COORD_RAM_MB:+-v coord_ram_mb=$COORD_RAM_MB} \
+        ${WORKER_RAM_MB:+-v worker_ram_mb=$WORKER_RAM_MB} \
+        ${COORD_DISK_MB:+-v coord_disk_mb=$COORD_DISK_MB} \
+        ${WORKER_DISK_MB:+-v worker_disk_mb=$WORKER_DISK_MB} \
+        -f "$path" > "$out" 2> "$err" || true
+
+    # Pick the most severe verdict line anywhere in the output (advisors
+    # may emit several: one per sub-check). Order CRITICAL > WARN > INFO > OK.
+    local line=""
+    local sev_token=""
+    if grep -qE '^[[:space:]]*\|?[[:space:]]*CRITICAL[[:space:]]*:' "$out"; then
+        sev_token="CRITICAL"
+        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*CRITICAL[[:space:]]*:' "$out" | head -n1 \
+                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
+    elif grep -qE '^[[:space:]]*\|?[[:space:]]*WARN[[:space:]]*:' "$out"; then
+        sev_token="WARN"
+        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*WARN[[:space:]]*:' "$out" | head -n1 \
+                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
+    elif grep -qE '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out"; then
+        sev_token="OK"
+        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out" | head -n1 \
+                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
+    elif grep -qE '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out"; then
+        sev_token="INFO"
+        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out" | head -n1 \
+                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
+    fi
+    [[ -z "$line" ]] && line="(no verdict headline; see ${id}.out)"
+
+    case "$sev_token" in
+        CRITICAL) (( WORST < 2 )) && WORST=2;;
+        WARN)     (( WORST < 1 )) && WORST=1;;
+    esac
+    HEADLINES+=("${sev_token:-?} ${id}  ${title}  -- ${line}")
+}
+
+echo "running advisors ..." | tee -a "$SUMMARY"
+for entry in "${ADVISORS[@]}"; do
+    IFS=":" read -r aid atitle afile <<< "$entry"
+    run_advisor "$aid" "$atitle" "$afile"
+done
+
+# =====================================================================
+# Step 3: executive summary
+# =====================================================================
+badge() {
+    case "$1" in
+        CRITICAL) echo "[X]";;
+        WARN)     echo "[!]";;
+        OK)       echo "[+]";;
+        INFO)     echo "[i]";;
+        *)        echo "[?]";;
+    esac
+}
+
+{
+    echo
+    echo "============================================================"
+    echo " CITUS_ANALYZE EXECUTIVE SUMMARY"
+    echo "============================================================"
+    printf "  %-9s  %-4s  %s\n" "SEVERITY" "ID" "HEADLINE"
+    echo "  ---------  ----  -------------------------------------------"
+    for h in "${HEADLINES[@]}"; do
+        sev="$(echo "$h" | awk '{print $1}')"
+        rest="$(echo "$h" | cut -d' ' -f2-)"
+        printf "  %s %-6s  %s\n" "$(badge "$sev")" "$sev" "$rest"
+    done
+    echo
+    case "$WORST" in
+        0) echo "  OVERALL: OK   - no issues flagged.";;
+        1) echo "  OVERALL: WARN - at least one advisor returned WARN.";;
+        2) echo "  OVERALL: CRITICAL - at least one advisor returned CRITICAL.";;
+    esac
+    echo "  Full per-advisor output: $OUT_DIR/{M1,D1,Q1,GUC1,V1,P1,I1,B1,CP1,R2,REF1,W1,STAT1,SEC1,NET1,REP1,GR1,C3,S3,R1,N6,A3,SC1,P2,MX1}.out"
+    echo "  Raw cluster snapshot:    $GATHER_OUT"
+    echo
+} | tee -a "$SUMMARY"
+
+# =====================================================================
+# Step 4: render additional output formats (HTML / PDF)
+# =====================================================================
+render_html() {
+    local rundir="$1"
+    local html="$rundir/report.html"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "WARN: python3 not found; skipping HTML render." | tee -a "$SUMMARY" >&2
+        return 1
+    fi
+    if [[ ! -r "$REPO_ROOT/lib/render_html.py" ]]; then
+        echo "WARN: lib/render_html.py missing; skipping HTML render." | tee -a "$SUMMARY" >&2
+        return 1
+    fi
+    if python3 "$REPO_ROOT/lib/render_html.py" "$rundir" >> "$SUMMARY" 2>&1; then
+        echo "  HTML report: $html" | tee -a "$SUMMARY"
+        return 0
+    fi
+    echo "WARN: HTML render failed; see $SUMMARY for details." | tee -a "$SUMMARY" >&2
+    return 1
+}
+
+render_pdf() {
+    # Converts the HTML report (rendering it first if absent) to PDF using
+    # whichever converter is available. Order: weasyprint → wkhtmltopdf →
+    # chromium/chrome headless. All three are commonly available; at least
+    # one is usually installable via brew/apt/pip in a few seconds.
+    local rundir="$1"
+    local html="$rundir/report.html"
+    local pdf="$rundir/report.pdf"
+    if [[ ! -r "$html" ]]; then
+        render_html "$rundir" || return 1
+    fi
+    local converter=""
+    if command -v weasyprint >/dev/null 2>&1; then
+        converter="weasyprint"
+    elif command -v wkhtmltopdf >/dev/null 2>&1; then
+        converter="wkhtmltopdf"
+    elif command -v chromium >/dev/null 2>&1; then
+        converter="chromium"
+    elif command -v chromium-browser >/dev/null 2>&1; then
+        converter="chromium-browser"
+    elif command -v google-chrome >/dev/null 2>&1; then
+        converter="google-chrome"
+    elif [[ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
+        converter="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    elif [[ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ]]; then
+        converter="/Applications/Chromium.app/Contents/MacOS/Chromium"
+    fi
+    if [[ -z "$converter" ]]; then
+        {
+            echo "WARN: no PDF converter found. Install one of:"
+            echo "        pip install weasyprint     # simplest"
+            echo "        brew install wkhtmltopdf   # or apt-get install wkhtmltopdf"
+            echo "        Chrome / Chromium (auto-detected when present)"
+            echo "      Skipping PDF for this run; HTML is available at:"
+            echo "        $html"
+        } | tee -a "$SUMMARY" >&2
+        return 1
+    fi
+    local log="$rundir/pdf.log"
+    local rc=0
+    case "$converter" in
+        weasyprint)
+            weasyprint "$html" "$pdf" > "$log" 2>&1 || rc=$?
+            ;;
+        wkhtmltopdf)
+            # --enable-local-file-access needed for file:// links inside HTML.
+            wkhtmltopdf --enable-local-file-access --quiet "$html" "$pdf" > "$log" 2>&1 || rc=$?
+            ;;
+        *)
+            # Chromium-family. file:// URL required. Running with
+            # --no-sandbox for non-interactive CI; safe since we control the input.
+            "$converter" --headless --disable-gpu --no-sandbox \
+                         --print-to-pdf="$pdf" \
+                         --print-to-pdf-no-header \
+                         "file://$html" > "$log" 2>&1 || rc=$?
+            ;;
+    esac
+    if (( rc == 0 )) && [[ -s "$pdf" ]]; then
+        echo "  PDF report : $pdf  (via $(basename "$converter"))" | tee -a "$SUMMARY"
+        return 0
+    fi
+    echo "WARN: PDF render failed (rc=$rc via $(basename "$converter")); see $log" | tee -a "$SUMMARY" >&2
+    return 1
+}
+
+# Parse --output-format into a normalised set. text is implicit.
+WANT_HTML=0
+WANT_PDF=0
+IFS=',' read -r -a _fmts <<< "$OUTPUT_FORMAT"
+for f in "${_fmts[@]}"; do
+    f="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]' | awk '{$1=$1}1')"
+    case "$f" in
+        ""|text|txt)  ;;
+        html)  WANT_HTML=1 ;;
+        pdf)   WANT_PDF=1 ; WANT_HTML=1 ;;
+        all)   WANT_HTML=1 ; WANT_PDF=1 ;;
+        *) echo "WARN: unknown --output-format value '$f'; valid: text|html|pdf|all" >&2 ;;
+    esac
+done
+
+if (( WANT_HTML )); then
+    echo | tee -a "$SUMMARY"
+    echo "rendering additional formats ..." | tee -a "$SUMMARY"
+    render_html "$OUT_DIR"
+fi
+if (( WANT_PDF )); then
+    render_pdf "$OUT_DIR"
+fi
+
+# Exit policy: map observed WORST severity to an exit code gated by --fail-on.
+# This lets CI pin on CRITICAL only (benign WARN noise doesn't fail the build)
+# or require full cleanliness (fail on INFO too).
+FAIL_ON_LC="$(printf '%s' "$FAIL_ON" | tr '[:upper:]' '[:lower:]')"
+case "$FAIL_ON_LC" in
+    none)      exit 0;;
+    critical)  exit $(( WORST >= 2 ? 2 : 0 ));;
+    warn|"")   exit "$WORST";;
+    info)      exit "$WORST";;
+    *) echo "WARN: unknown --fail-on value '$FAIL_ON'; defaulting to 'warn'." >&2
+       exit "$WORST";;
+esac

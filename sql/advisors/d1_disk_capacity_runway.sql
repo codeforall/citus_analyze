@@ -207,7 +207,7 @@ SELECT format(
     WHEN NOT c.success
       THEN format('ERROR : node unreachable during collection.')
     WHEN c.disk_mb_input = 0
-      THEN format('INFO : pass -v %s_disk_mb=<total disk MB> to get a runway verdict.',
+      THEN format('INFO : disk capacity not provided. Find total MB with:  df -BM --output=size $(psql -Atc "show data_directory") | tail -1  -- then re-run with -v %s_disk_mb=<value>.',
                   CASE WHEN c.groupid = 0 THEN 'coord' ELSE 'worker' END)
     WHEN c.free_pct < :crit_free_pct::numeric
       THEN format('CRITICAL : only %s%% free — node will fill up imminently.', c.free_pct)

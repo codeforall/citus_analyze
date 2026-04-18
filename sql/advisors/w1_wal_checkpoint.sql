@@ -243,9 +243,19 @@ SELECT role, node,
        END AS wal_per_sec_avg,
        wal_buffers_full,
        CASE
+         -- Only flag wal_buffers size if we also see evidence of pressure
+         -- (wal_buffers_full > 0). PG's default of -1 auto-sizes wal_buffers
+         -- to min(shared_buffers/32, 16MB); on small shared_buffers this is
+         -- documented behaviour and raising wal_buffers alone changes
+         -- nothing. The real signal is wal_buffers_full.
+         WHEN wal_buffers_bytes < (:w1_min_wal_buffers_mb)::bigint * 1048576
+              AND COALESCE(wal_buffers_full, 0) > 0
+           THEN format(
+             'WARN: wal_buffers=%s < %s MB AND wal_buffers_full=%s > 0 -- raise wal_buffers (or shared_buffers so auto-size goes up).',
+             pg_size_pretty(wal_buffers_bytes), (:w1_min_wal_buffers_mb)::text, wal_buffers_full)
          WHEN wal_buffers_bytes < (:w1_min_wal_buffers_mb)::bigint * 1048576
            THEN format(
-             'WARN: wal_buffers=%s < %s MB (low). On a busy node this causes wal_buffers_full spin on XLogInsert.',
+             'INFO: wal_buffers=%s < %s MB but no wal_buffers_full pressure observed (default auto-size on small shared_buffers).',
              pg_size_pretty(wal_buffers_bytes), (:w1_min_wal_buffers_mb)::text)
          WHEN wal_buffers_full > 1000 AND wal_stats_reset IS NOT NULL
               AND wal_buffers_full::numeric
@@ -347,11 +357,13 @@ SELECT (
     WHEN EXISTS (
            SELECT 1 FROM _w1_flat
            WHERE wal_buffers_bytes < (:w1_min_wal_buffers_mb)::bigint * 1048576
+             AND COALESCE(wal_buffers_full, 0) > 0
          )
       THEN format(
-        'WARN : %s node(s) have wal_buffers < %s MB. See W1c.',
+        'WARN : %s node(s) have wal_buffers < %s MB AND observed wal_buffers_full pressure. See W1c.',
         (SELECT COUNT(*) FROM _w1_flat
-          WHERE wal_buffers_bytes < (:w1_min_wal_buffers_mb)::bigint * 1048576),
+          WHERE wal_buffers_bytes < (:w1_min_wal_buffers_mb)::bigint * 1048576
+            AND COALESCE(wal_buffers_full, 0) > 0),
         (:w1_min_wal_buffers_mb)::text
       )
     WHEN EXISTS (

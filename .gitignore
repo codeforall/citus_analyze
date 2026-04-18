@@ -1,7 +1,15 @@
-# citus_analyze output
+# citus_analyze run outputs — keep the dir, ignore its contents
+reports/*
+!reports/.gitkeep
+
+# legacy output dirs (pre-reorg)
 citus_analyze_*/
 *.out
 *.err
+
+# Python
+__pycache__/
+*.pyc
 
 # macOS
 .DS_Store

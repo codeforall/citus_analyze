@@ -78,8 +78,12 @@ SELECT jsonb_build_object(
                  'max_connections',
                  'max_prepared_transactions',
                  'max_locks_per_transaction',
+                 'max_worker_processes',
                  'max_wal_senders',
                  'max_replication_slots',
+                 'shared_preload_libraries',
+                 'server_version_num',
+                 'lc_collate','lc_ctype','lc_monetary','lc_numeric','lc_time',
                  'wal_level',
                  'hot_standby_feedback',
                  'idle_in_transaction_session_timeout',
@@ -109,7 +113,6 @@ SELECT jsonb_build_object(
                  'citus.task_executor_type',
                  'citus.log_remote_commands',
                  'citus.writable_standby_coordinator',
-                 'citus.replicate_reference_tables_on_activate',
                  'citus.defer_drop_after_shard_move',
                  'citus.defer_drop_after_shard_split'
                )),
@@ -170,7 +173,20 @@ SELECT name,
        variants,
        layout,
        CASE
-         -- Settings that MUST agree across the cluster
+         -- Tier 1: "must match" cluster-wide. Drift CAN break the cluster
+         -- (parallel exec stalls, 2PC silently disabled, MX misroutes,
+         --  extension load mismatches on restart). Escalate to CRITICAL.
+         WHEN name IN (
+           'max_worker_processes',
+           'max_connections',
+           'max_prepared_transactions',
+           'shared_preload_libraries',
+           'wal_level',
+           'server_version_num',
+           'lc_collate', 'lc_ctype', 'lc_monetary', 'lc_numeric', 'lc_time'
+         ) THEN 'CRITICAL'
+         -- Tier 2: "should match" but won't immediately break things
+         -- (pool sizes, timeouts, safety toggles).
          WHEN name IN (
            'citus.max_shared_pool_size',
            'citus.local_shared_pool_size',
@@ -180,16 +196,21 @@ SELECT name,
            'citus.multi_shard_modify_mode',
            'citus.enable_local_execution',
            'citus.enable_repartition_joins',
-           'citus.shard_count',
            'citus.shard_replication_factor',
            'citus.task_executor_type',
-           'max_prepared_transactions',
-           'wal_level',
            'fsync',
            'full_page_writes',
            'autovacuum',
            'track_counts'
          ) THEN 'WARN'
+         -- Tier 2b: legitimately per-session/per-role defaults. Drift is
+         -- usually benign (e.g. citus.shard_count is the default for NEW
+         -- distributed tables and is session-settable; the shard count of
+         -- an existing table is frozen at create_distributed_table time).
+         -- Surface as INFO by default.
+         WHEN name IN (
+           'citus.shard_count'
+         ) THEN 'INFO'
          -- Legitimately heterogeneous (RAM, work_mem, locks): severity
          -- is user-tunable via -v warn_drift_severity=info
          ELSE :'_clamped_drift_sev'
@@ -249,12 +270,15 @@ FROM _guc_map
 WHERE name='citus.recover_2pc_interval' AND value='0'
   AND (SELECT count(*) FROM pg_dist_node WHERE isactive) > 1;
 
--- Rule R4: idle_in_transaction_session_timeout=0 → unbounded bloat risk
+-- Rule R4: idle_in_transaction_session_timeout=0 → unbounded bloat risk.
+-- Note: 0 is the PG-shipped default. Q1 owns the real signal (observed
+-- idle-in-tx sessions pinning xmin). We emit INFO here so policy-driven
+-- hardening reports see it, but we don't fail a run on the default value.
 INSERT INTO _guc_rules
 SELECT 'R4:idle_in_tx_timeout',
-       'WARN',
+       'INFO',
        node,
-       format('idle_in_transaction_session_timeout=0 on %s; stuck idle-in-tx can pin xmin/WAL indefinitely. See Q1.', node)
+       format('idle_in_transaction_session_timeout=0 on %s (PG default); stuck idle-in-tx sessions can pin xmin/WAL. See Q1 for actual observed backlog.', node)
 FROM _guc_map
 WHERE name='idle_in_transaction_session_timeout' AND value='0';
 
@@ -407,7 +431,6 @@ FROM (
     ('citus.enable_repartition_joins'),('citus.shard_count'),
     ('citus.shard_replication_factor'),('citus.task_executor_type'),
     ('citus.log_remote_commands'),('citus.writable_standby_coordinator'),
-    ('citus.replicate_reference_tables_on_activate'),
     ('citus.defer_drop_after_shard_move'),
     ('citus.defer_drop_after_shard_split')
 ) AS expected(name)
@@ -454,6 +477,7 @@ WITH sev AS (
     (SELECT count(*) FROM _guc_rules WHERE severity='CRITICAL')                AS crit_n,
     (SELECT count(*) FROM _guc_rules WHERE severity='WARN')                    AS warn_n,
     (SELECT count(*) FROM _guc_rules WHERE severity='INFO')                    AS info_n,
+    (SELECT count(*) FROM _guc_drift WHERE severity='CRITICAL')                AS drift_crit,
     (SELECT count(*) FROM _guc_drift WHERE severity='WARN')                    AS drift_warn,
     (SELECT count(*) FROM _guc_drift WHERE severity='INFO')                    AS drift_info,
     (SELECT count(*) FROM _guc_raw  WHERE NOT success)                         AS unreachable
@@ -461,9 +485,9 @@ WITH sev AS (
 SELECT CASE
   WHEN unreachable > 0 THEN
     format('WARN : %s node(s) unreachable during GUC1 snapshot.', unreachable)
-  WHEN crit_n > 0 THEN
-    format('CRITICAL : %s rule violation(s); %s drift(s); %s warning(s). Fix the CRITICAL rows in GUC1b first.',
-           crit_n, drift_warn, warn_n)
+  WHEN crit_n + drift_crit > 0 THEN
+    format('CRITICAL : %s rule violation(s); %s must-match GUC drift(s); %s warning(s). Must-match drift breaks parallel exec / 2PC / MX routing.',
+           crit_n, drift_crit, warn_n + drift_warn)
   WHEN warn_n + drift_warn > 0 THEN
     format('WARN : %s rule warning(s); %s cross-node drift(s). Review GUC1a/GUC1b.',
            warn_n, drift_warn)
