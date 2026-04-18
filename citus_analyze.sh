@@ -35,6 +35,8 @@ HOSTARG=""
 PORTARG=""
 DBARG=""
 USERARG=""
+COORD_RAM_MB=""
+WORKER_RAM_MB=""
 ADVISORS_ONLY=0
 GATHER_ONLY=0
 
@@ -52,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --uri)          URI="$2"; shift 2;;
         -o|--out-dir)   OUT_DIR="$2"; shift 2;;
         --psql)         PSQL_BIN="$2"; shift 2;;
+        --coord-ram-mb)  COORD_RAM_MB="$2"; shift 2;;
+        --worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
         --advisors-only) ADVISORS_ONLY=1; shift;;
         --gather-only)  GATHER_ONLY=1; shift;;
         --help)         usage;;
@@ -124,6 +128,7 @@ fi
 # =====================================================================
 # each entry: "id:title:file"
 ADVISORS=(
+  "M1:Node memory minimum (OOM-safety):advisors/m1_node_memory_minimum.sql"
   "GR1:Shard/partition growth memory model:advisors/gr1_shard_growth_advisor.sql"
   "C3:Max safe external connections (MX-aware):advisors/c3_max_external_connections.sql"
   "S3:Data skew across shards & workers:advisors/s3_data_skew_advisor.sql"
@@ -145,10 +150,13 @@ run_advisor() {
         HEADLINES+=("? ${id}  ${title}  -- sketch file missing: $file")
         return
     fi
-    "$PSQL_BIN" "${PSQL_ARGS[@]}" -f "$path" > "$out" 2> "$err" || true
+    "$PSQL_BIN" "${PSQL_ARGS[@]}" \
+        ${COORD_RAM_MB:+-v coord_ram_mb=$COORD_RAM_MB} \
+        ${WORKER_RAM_MB:+-v worker_ram_mb=$WORKER_RAM_MB} \
+        -f "$path" > "$out" 2> "$err" || true
 
     # Pick the most severe verdict line anywhere in the output (advisors
-    # may emit several: one per sub-check). Order CRITICAL > WARN > OK.
+    # may emit several: one per sub-check). Order CRITICAL > WARN > INFO > OK.
     local line=""
     local sev_token=""
     if grep -qE '^[[:space:]]*\|?[[:space:]]*CRITICAL[[:space:]]*:' "$out"; then
@@ -162,6 +170,10 @@ run_advisor() {
     elif grep -qE '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out"; then
         sev_token="OK"
         line="$(grep -E '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out" | head -n1 \
+                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
+    elif grep -qE '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out"; then
+        sev_token="INFO"
+        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out" | head -n1 \
                  | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
     fi
     [[ -z "$line" ]] && line="(no verdict headline; see ${id}.out)"
@@ -187,6 +199,7 @@ badge() {
         CRITICAL) echo "[X]";;
         WARN)     echo "[!]";;
         OK)       echo "[+]";;
+        INFO)     echo "[i]";;
         *)        echo "[?]";;
     esac
 }

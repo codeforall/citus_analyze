@@ -103,7 +103,7 @@ PGHOST=coord PGDATABASE=citus ./citus_analyze.sh
 Output (everything lands in `./citus_analyze_<UTC-timestamp>/` by default):
 
 ```
-output directory: ./citus_analyze_20260418T004526Z
+output directory: ./citus_analyze_20260418T005526Z
 connected OK. citus_version: Citus 12.1.x on x86_64-pc-linux-gnu ...
 running citus_gather.sql ...
   gather OK: 31 sections,      463 lines, ~7 KB gzipped
@@ -114,11 +114,12 @@ running advisors ...
 ============================================================
   SEVERITY   ID    HEADLINE
   ---------  ----  -------------------------------------------
-  [!] WARN     GR1  Shard/partition growth memory model  -- WARN : max_locks_per_transaction must rise from 64 to at least 320 (requires postmaster restart).
+  [i] INFO     M1   Node memory minimum  -- INFO : pass --coord-ram-mb / --worker-ram-mb for pass/fail verdict. RECOMMENDED NODE RAM 3.92 GB (see M1.out).
+  [+] OK       GR1  Shard/partition growth memory model  -- OK : target is at or below current footprint.
   [+] OK       C3   Max safe external connections (MX-aware)  -- OK : safe up to 136 concurrent external sessions under current config.
   [X] CRITICAL S3   Data skew across shards & workers  -- CRITICAL : colocation 11 has max/avg = 128.67 (>= 5.0). Isolate hot tenant or re-pick distribution key.
   [+] OK       R1   Rebalance / background-job health  -- OK : background-job queue is idle and clean.
-  [X] CRITICAL N6   Metadata-sync feasibility for add-node  -- CRITICAL : add-node WILL fail on lock-slot exhaustion (needs 408, candidate has 64). Raise max_locks_per_transaction to 448 before adding.
+  [+] OK       N6   Metadata-sync feasibility for add-node  -- OK : payload 0.1 MB < 50 MB. Either mode works; transactional (default) is fine.
   [+] OK       A3   2PC backlog & orphan prepared xacts  -- OK : no 2PC backlog.
 
   OVERALL: CRITICAL - at least one advisor returned CRITICAL.
@@ -156,6 +157,8 @@ in `gather.out` and the advisor `*.out` files directly.
       --uri URI               full libpq URI (overrides -h/-p/-d/-U)
   -o, --out-dir DIR           output directory (default: ./citus_analyze_<ts>)
       --psql PATH             path to psql binary (overrides PSQL_BIN env, default: psql on PATH)
+      --coord-ram-mb MB       coordinator RAM in MB (enables M1 pass/fail verdict)
+      --worker-ram-mb MB      per-worker RAM in MB  (enables M1 pass/fail verdict)
       --gather-only           run citus_gather.sql, skip advisors
       --advisors-only         run advisors, skip citus_gather.sql
       --help
@@ -176,6 +179,8 @@ Exit code:
 All advisors can be run standalone:
 
 ```bash
+psql -X -f advisors/m1_node_memory_minimum.sql \
+       -v coord_ram_mb=4096 -v worker_ram_mb=8192
 psql -X -f advisors/gr1_shard_growth_advisor.sql
 psql -X -f advisors/c3_max_external_connections.sql \
        -v headroom_pct=70 -v k_reuse=0.5 -v overhead=20
@@ -185,12 +190,92 @@ All of them accept `psql -v` overrides for their input assumptions (RAM per
 node, link Mbps, future shard count, connection-pool reuse factor, etc).
 Sensible defaults are picked from your live cluster.
 
+### M1 — Node memory minimum (OOM-safety)
+
+**The most important advisor.** Produces a concrete minimum- and
+recommended-RAM number for each node (coordinator and every worker) so you
+can size or audit hardware without guesswork — and catches the classic
+Citus failure mode where raising shard count or partition count pushes a
+node over the edge into OOM.
+
+Model:
+
+```
+  MIN RAM (steady) = shared_buffers
+                   + max_connections * per_backend_steady
+                   + autovacuum_max_workers * maintenance_work_mem
+                   + wal_buffers + temp_buffers * max_conn/4
+                   + citus_outbound_pool        (MX entry nodes only)
+
+  PEAK RAM (burst) = same but per_backend peaks at
+                     (baseline + citus_meta + peak_query_mult * work_mem)
+                   + 2 * maintenance_work_mem   (CREATE INDEX, VACUUM burst)
+                   + max_parallel_workers * work_mem
+
+  RECOMMENDED RAM  = PEAK RAM + max(1 GB, 10% OS/kernel reserve)
+```
+
+`per_backend_steady` grows with the Citus metadata cache, which scales
+with placement count. **MX entry nodes cache every placement in the
+cluster** (not just local placements) — this is why memory use balloons
+on MX clusters as you add shards. M1 captures this correctly by using
+`cached_placements` per node role.
+
+Pass measured RAM with `-v coord_ram_mb=N -v worker_ram_mb=N` (or via the
+driver's `--coord-ram-mb` / `--worker-ram-mb` flags) for a verdict:
+
+| verdict  | condition                                                     |
+|----------|---------------------------------------------------------------|
+| CRITICAL | measured < PEAK RAM — node **will OOM** under burst load      |
+| WARN     | measured < 1.5 × MIN RAM — no burst headroom, flappy           |
+| OK       | measured ≥ PEAK RAM                                           |
+| INFO     | measured RAM not supplied — advisory-only number printed       |
+
+Example on the current live cluster (defaults, no measured RAM):
+
+```
+MIN RAM (steady peak)       : 2028 MB  ~  1.98 GB
+PEAK RAM (worst-case burst) : 2988 MB  ~  2.92 GB
+OS/kernel reserve (added)   : 1024 MB
+RECOMMENDED NODE RAM        : 4012 MB  ~  3.92 GB
+```
+
 ### GR1 — Shard / partition growth memory model
 
 Models the per-node memory and lock-slot budget *as a function of proposed
 shard count and partition count*. Answers "can I safely bump shard count
 from 32 to 256?" — and if not, by exactly how many MB of RAM and how many
 lock slots each worker would fall short.
+
+**Lock-table math** (corrected against PG `storage/lmgr/lock.c`):
+
+PostgreSQL's shared lock hash has capacity
+`max_locks_per_transaction × (MaxBackends + max_prepared_xacts)`,
+where `MaxBackends = max_connections + autovacuum_max_workers
++ max_wal_senders + max_worker_processes`. The per-backend quota in the
+GUC name is an *average*, not a cap — a single backend can exceed it as
+long as the total hash has room. Failure (`"out of shared memory; You
+might need to increase max_locks_per_transaction"`) fires only when the
+hash cannot admit a new entry.
+
+GR1 therefore sizes by *peak cluster demand*:
+
+```
+peak_single_backend = proposed_shards × (1 + avg_indexes_per_shard
+                                         + (write_mode ? 2 : 0))
+                      # +2 for LockShardResource + LockShardDistributionMetadata
+peak_cluster_demand = N_xshard × peak_single_backend
+                    + (max_conn - N_xshard) × ordinary_locks_per_backend
+                    × lock_safety_factor        # default 1.5
+lpt_needed = ceil(peak_cluster_demand / (MaxBackends + max_prepared_xacts) / 64) × 64
+```
+
+Tunable knobs (via `-v`):
+`avg_indexes_per_shard` (auto-detected from `pg_index`),
+`fraction_cross_shard` (default 0.10),
+`ordinary_locks_per_backend` (default 10),
+`lock_safety_factor` (default 1.5),
+`write_mode` (default 1).
 
 Flags CRITICAL when:
 - `lpt_needed > 2000` (unworkable max_locks_per_transaction)
@@ -252,6 +337,16 @@ pg_dist_object, schema-sharded metadata, etc) and predicts:
 
 - **Lock-slot demand** on the candidate — the most common Citus add-node
   failure is `out of shared memory; raise max_locks_per_transaction`.
+  Modelled as a **single transaction on the candidate** creating every
+  shell table, every partition, and their indexes — so the peak is one
+  backend holding
+  `(dist_tables + ref_tables + partitions) × (1 + avg_indexes_per_shard)`
+  relation locks. Required capacity is compared against the candidate's
+  planned
+  `max_locks_per_transaction × (MaxBackends + max_prepared_xacts)`
+  (see PG `lock.c` `NLOCKENTS()`). Tunable via `-v candidate_max_lpt`,
+  `candidate_max_prep`, `candidate_max_conn`, `avg_indexes_per_shard`,
+  `lock_safety_factor`.
 - **Candidate backend peak memory** — flagged if > 25% of candidate RAM.
 - **Coordinator peak memory** during command-list materialisation
   (transactional mode only).

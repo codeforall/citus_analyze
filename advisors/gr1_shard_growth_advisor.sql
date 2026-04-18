@@ -14,6 +14,26 @@
 --   k_meta_per_replica             (bytes; default 40)
 --   k_relcache                     (bytes / relation / backend; default 51200)
 --   k_lockslot                     (bytes / lock slot; default 270)
+--   avg_indexes_per_shard          (int; auto-detected from pg_index, default 1)
+--   fraction_cross_shard           (0..1; share of backends concurrently running
+--                                    multi-shard xacts; default 0.10)
+--   ordinary_locks_per_backend     (int; lock budget for normal OLTP backends;
+--                                    default 10 — PG's historical sizing assumption)
+--   lock_safety_factor             (multiplier on peak cluster demand; default 1.5)
+--   write_mode                     (1 = cross-shard DML path is the peak, adds
+--                                    LockShardDistributionMetadata + LockShardResource
+--                                    per shard; 0 = SELECT-only peak; default 1)
+--
+-- LOCK-TABLE MODEL (see PG storage/lmgr/lock.c, NLOCKENTS()):
+--   The shared hash capacity is
+--       max_locks_per_transaction * (MaxBackends + max_prepared_xacts)
+--   where MaxBackends = max_connections + autovacuum_max_workers
+--                       + max_wal_senders + max_worker_processes.
+--   A single backend can exceed max_locks_per_transaction as long as the
+--   TOTAL hash still has room. Failure ("out of shared memory; You might
+--   need to increase max_locks_per_transaction") fires when the hash
+--   cannot admit a new entry. GR1 therefore sizes by peak cluster demand,
+--   not per-backend demand.
 --
 -- Usage:
 --   psql citus -f gr1_shard_growth_advisor.sql \
@@ -34,6 +54,11 @@
 \if :{?k_meta_per_replica}           \else \set k_meta_per_replica          40 \endif
 \if :{?k_relcache}                   \else \set k_relcache               51200 \endif
 \if :{?k_lockslot}                   \else \set k_lockslot                 270 \endif
+\if :{?avg_indexes_per_shard}        \else \set avg_indexes_per_shard       -1 \endif
+\if :{?fraction_cross_shard}         \else \set fraction_cross_shard       0.10 \endif
+\if :{?ordinary_locks_per_backend}   \else \set ordinary_locks_per_backend  10 \endif
+\if :{?lock_safety_factor}           \else \set lock_safety_factor         1.5 \endif
+\if :{?write_mode}                   \else \set write_mode                   1 \endif
 
 -- ---------------------------------------------------------------------
 -- Gather facts + projections into a single-row temp table
@@ -55,6 +80,21 @@ facts AS (
         (SELECT setting::int FROM pg_settings WHERE name='max_connections')          AS max_conn,
         (SELECT setting::int FROM pg_settings WHERE name='max_prepared_transactions') AS max_prep,
         (SELECT setting::int FROM pg_settings WHERE name='max_locks_per_transaction') AS max_lpt,
+        (SELECT setting::int FROM pg_settings WHERE name='autovacuum_max_workers')    AS av_workers,
+        (SELECT setting::int FROM pg_settings WHERE name='max_wal_senders')           AS wal_senders,
+        (SELECT setting::int FROM pg_settings WHERE name='max_worker_processes')      AS worker_procs,
+        -- Auto-detected avg indexes per distributed table (>=1 implicit PK assumed
+        -- when override not provided). The number of indexes propagates to every
+        -- shard, so peak single-backend lock count scales with (1 + avg_idx).
+        GREATEST(
+          CASE WHEN :avg_indexes_per_shard >= 0 THEN :avg_indexes_per_shard
+               ELSE COALESCE(
+                 (SELECT ceil(count(i.*)::numeric
+                              / NULLIF(count(DISTINCT p.logicalrelid), 0))::int
+                    FROM pg_dist_partition p
+                    LEFT JOIN pg_index i ON i.indrelid = p.logicalrelid
+                    WHERE p.partmethod IN ('h','r')), 1)
+          END, 1)                                                                    AS avg_idx_per_shard,
         (SELECT count(*)::int FROM pg_stat_activity
            WHERE backend_type='client backend' AND pid <> pg_backend_pid())          AS backends_now
 ),
@@ -91,14 +131,68 @@ SELECT f.*,
                   THEN f.part_parents_now * t.t_parts_per_parent
                   ELSE f.part_children_now END
            + f.ref_tables) * :k_relcache)::bigint                                    AS t_relc_b,
-       -- lock table (shared memory)
-       (:k_lockslot::bigint * f.max_lpt * (f.max_conn + f.max_prep))                 AS lock_bytes_now,
-       GREATEST(f.max_lpt,
-                CEIL((t.t_shards_total * 1.5) / 64.0)::int * 64)                     AS lpt_needed,
-       (:k_lockslot::bigint *
-           GREATEST(f.max_lpt, CEIL((t.t_shards_total * 1.5) / 64.0)::int * 64) *
-           (f.max_conn + f.max_prep))                                                AS lock_bytes_needed
-FROM facts f, tgt t;
+       -- ---- Lock table (shared memory) — see PG lock.c NLOCKENTS() ----
+       --   NLOCKENTS() = max_locks_per_xact * (MaxBackends + max_prepared_xacts)
+       --   MaxBackends = max_connections + autovacuum_max_workers
+       --               + max_wal_senders + max_worker_processes
+       lm.max_backends,
+       lm.hash_capacity_now,
+       lm.lock_bytes_now,
+       lm.peak_locks_per_xshard_backend,
+       lm.n_xshard_backends,
+       lm.peak_cluster_locks,
+       lm.lpt_needed,
+       lm.lock_bytes_needed
+FROM facts f, tgt t,
+LATERAL (
+  SELECT
+    (f.max_conn + f.av_workers + f.wal_senders + f.worker_procs)::int AS max_backends,
+    (f.max_lpt::bigint
+       * ((f.max_conn + f.av_workers + f.wal_senders + f.worker_procs) + f.max_prep)
+    )                                                                 AS hash_capacity_now,
+    (:k_lockslot::bigint * f.max_lpt
+       * ((f.max_conn + f.av_workers + f.wal_senders + f.worker_procs) + f.max_prep)
+    )                                                                 AS lock_bytes_now,
+    (t.t_shards_total::bigint
+       * (1 + f.avg_idx_per_shard
+            + CASE WHEN :write_mode = 1 THEN 2 ELSE 0 END)
+    )                                                                 AS peak_locks_per_xshard_backend,
+    GREATEST(1, ceil(f.max_conn * :fraction_cross_shard::numeric)::int) AS n_xshard_backends
+) lm0,
+LATERAL (
+  SELECT
+    lm0.max_backends,
+    lm0.hash_capacity_now,
+    lm0.lock_bytes_now,
+    lm0.peak_locks_per_xshard_backend,
+    lm0.n_xshard_backends,
+    CEIL(
+      ( lm0.n_xshard_backends::bigint * lm0.peak_locks_per_xshard_backend
+        + GREATEST(0, f.max_conn - lm0.n_xshard_backends)::bigint
+             * :ordinary_locks_per_backend::bigint
+      ) * :lock_safety_factor::numeric
+    )::bigint                                                         AS peak_cluster_locks
+) lm1,
+LATERAL (
+  SELECT
+    lm1.max_backends, lm1.hash_capacity_now, lm1.lock_bytes_now,
+    lm1.peak_locks_per_xshard_backend, lm1.n_xshard_backends,
+    lm1.peak_cluster_locks,
+    GREATEST(
+      f.max_lpt,
+      CEIL( lm1.peak_cluster_locks::numeric
+            / NULLIF((lm1.max_backends + f.max_prep), 0)
+            / 64.0 )::int * 64
+    )                                                                 AS lpt_needed
+) lm2,
+LATERAL (
+  SELECT
+    lm2.max_backends, lm2.hash_capacity_now, lm2.lock_bytes_now,
+    lm2.peak_locks_per_xshard_backend, lm2.n_xshard_backends,
+    lm2.peak_cluster_locks, lm2.lpt_needed,
+    (:k_lockslot::bigint * lm2.lpt_needed
+       * (lm2.max_backends + f.max_prep))                             AS lock_bytes_needed
+) lm;
 
 -- ---------------------------------------------------------------------
 -- Main report
@@ -142,17 +236,36 @@ SELECT line FROM (
            max_conn,
            round((max_conn * ((t_meta_b+t_relc_b)-(c_meta_b+c_relc_b))) / 1048576.0, 2)) FROM _gr1
   UNION ALL SELECT 30, '' FROM _gr1
-  UNION ALL SELECT 31, '-- Lock table (GR2 tie-in; shared memory, set at postmaster start) --' FROM _gr1
+  UNION ALL SELECT 31, '-- Lock table (PG NLOCKENTS = lpt * (MaxBackends + max_prepared_xacts); shared) --' FROM _gr1
   UNION ALL SELECT 32,
-    format('Current lock table   : %s * %s * (%s+%s)  =  %s MB',
-           :k_lockslot, max_lpt, max_conn, max_prep, round(lock_bytes_now/1048576.0, 2)) FROM _gr1
+    format('MaxBackends          : %s  = max_conn(%s) + av(%s) + wal_sender(%s) + worker_proc(%s)',
+           max_backends, max_conn, av_workers, wal_senders, worker_procs) FROM _gr1
   UNION ALL SELECT 33,
-    format('Needed (worst-case)  : max_locks_per_transaction >= %s  (current %s)%s',
+    format('Current hash capacity: lpt(%s) * (MaxBackends(%s) + mpx(%s)) = %s slots  (%s MB)',
+           max_lpt, max_backends, max_prep, hash_capacity_now,
+           round(lock_bytes_now/1048576.0, 2)) FROM _gr1
+  UNION ALL SELECT 34,
+    format('Peak demand model    : %s cross-shard backend(s) × %s locks/backend + %s ordinary × %s  → %s cluster-wide (×%s safety)',
+           n_xshard_backends,
+           peak_locks_per_xshard_backend,
+           GREATEST(0, max_conn - n_xshard_backends),
+           :ordinary_locks_per_backend,
+           peak_cluster_locks,
+           :lock_safety_factor) FROM _gr1
+  UNION ALL SELECT 35,
+    format('                       (avg_indexes_per_shard=%s, fraction_cross_shard=%s, write_mode=%s)',
+           avg_idx_per_shard, :fraction_cross_shard, :write_mode) FROM _gr1
+  UNION ALL SELECT 36,
+    format('Needed               : max_locks_per_transaction >= %s  (current %s, %s)%s',
            lpt_needed, max_lpt,
+           CASE WHEN peak_cluster_locks > hash_capacity_now
+                THEN format('saturation = %s%%', round(100.0 * peak_cluster_locks::numeric / NULLIF(hash_capacity_now,0), 0))
+                ELSE format('headroom = %s%%', round(100.0 * (1 - peak_cluster_locks::numeric / NULLIF(hash_capacity_now,0)), 0))
+           END,
            CASE WHEN lpt_needed > max_lpt
                 THEN '   *** ACTION: raise max_locks_per_transaction ***'
-                ELSE '   OK' END) FROM _gr1
-  UNION ALL SELECT 34,
+                ELSE '   OK — default or current value is sufficient' END) FROM _gr1
+  UNION ALL SELECT 37,
     format('Projected lock table : %s MB  (delta %s MB shared)',
            round(lock_bytes_needed/1048576.0, 2),
            round((lock_bytes_needed-lock_bytes_now)/1048576.0, 2)) FROM _gr1

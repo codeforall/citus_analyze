@@ -28,21 +28,35 @@
 --   payload >= 2 GB           -> nontransactional + maintenance window
 --
 -- Inputs (override with -v):
---   candidate_max_conn          (target node's planned max_connections)
---   candidate_max_lpt           (target node's planned max_locks_per_transaction)
+--   candidate_max_conn          (target node's planned max_connections; default 100)
+--   candidate_max_lpt           (target node's planned max_locks_per_transaction; default 64)
+--   candidate_max_prep          (target node's planned max_prepared_transactions; default 0, PG's actual default)
+--   candidate_av_workers        (target node's autovacuum_max_workers; default 3)
+--   candidate_wal_senders       (target node's max_wal_senders; default 10)
+--   candidate_worker_procs      (target node's max_worker_processes; default 8)
+--   avg_indexes_per_shard       (int; auto-detected; default 1 implicit PK)
+--   lock_safety_factor          (numeric; default 1.3 — per plan spec)
 --   candidate_work_mem_mb       (target node's work_mem in MB)
 --   candidate_maint_mb          (target node's maintenance_work_mem in MB)
 --   candidate_ram_mb            (target node's total RAM in MB)
 --   link_mbps                   (effective coord<->candidate bandwidth in MB/s)
---   k_role                      (bytes per role command; default 500)
---   k_dep_non_rel               (bytes per non-relation dependency; default 1024)
---   k_shell_table               (bytes per shell CREATE TABLE; default 2048)
---   k_partition                 (bytes per partition attach; default 400)
---   k_shard_row                 (bytes per pg_dist_shard row insert; default 200)
---   k_placement_row             (bytes per pg_dist_placement row insert; default 120)
---   k_obj_row                   (bytes per pg_dist_object row insert; default 300)
---   k_fkey                      (bytes per fkey recreate; default 500)
---   k_schema_row                (bytes per pg_dist_schema row; default 400)
+--   k_role / k_dep_non_rel / k_shell_table / k_partition / k_shard_row /
+--   k_placement_row / k_obj_row / k_fkey / k_schema_row  (payload size constants)
+--
+-- LOCK-TABLE MODEL (see PG storage/lmgr/lock.c, NLOCKENTS()):
+--   Total shared-hash capacity on the CANDIDATE is
+--       candidate_max_lpt * (candidate_MaxBackends + candidate_max_prepared_xacts)
+--   where candidate_MaxBackends = max_connections + autovacuum_max_workers
+--                                 + max_wal_senders + max_worker_processes.
+--   In transactional metadata sync, the *one* backend applying the snapshot
+--   on the candidate holds, simultaneously, relation locks on every shell
+--   table + every index + every partition + a handful of catalog entries,
+--   all until COMMIT. A single backend CAN exceed candidate_max_lpt as long
+--   as the TOTAL hash still has room. We therefore require:
+--     candidate_hash_capacity  >=  peak_backend_locks × lock_safety_factor
+--   which yields:
+--     candidate_max_lpt_needed = ceil(peak_backend_locks × safety
+--                                     / (MaxBackends + mpx) / 64) × 64
 -- =====================================================================
 
 \pset pager off
@@ -51,6 +65,12 @@
 
 \if :{?candidate_max_conn}     \else \set candidate_max_conn      100 \endif
 \if :{?candidate_max_lpt}      \else \set candidate_max_lpt        64 \endif
+\if :{?candidate_max_prep}     \else \set candidate_max_prep        0 \endif
+\if :{?candidate_av_workers}   \else \set candidate_av_workers      3 \endif
+\if :{?candidate_wal_senders}  \else \set candidate_wal_senders    10 \endif
+\if :{?candidate_worker_procs} \else \set candidate_worker_procs    8 \endif
+\if :{?avg_indexes_per_shard}  \else \set avg_indexes_per_shard    -1 \endif
+\if :{?lock_safety_factor}     \else \set lock_safety_factor       1.3 \endif
 \if :{?candidate_work_mem_mb}  \else \set candidate_work_mem_mb     4 \endif
 \if :{?candidate_maint_mb}     \else \set candidate_maint_mb       64 \endif
 \if :{?candidate_ram_mb}       \else \set candidate_ram_mb       4096 \endif
@@ -91,7 +111,17 @@ WITH facts AS (
             WHERE noderole='primary' AND isactive AND hasmetadata)                    AS mx_nodes,
         current_setting('citus.shard_replication_factor')::int                        AS rf,
         coalesce((SELECT current_setting('citus.metadata_sync_mode', true)),
-                 'transactional')                                                     AS sync_mode
+                 'transactional')                                                     AS sync_mode,
+        -- avg indexes per distributed table (>=1 implicit PK if override not given)
+        GREATEST(
+          CASE WHEN :avg_indexes_per_shard >= 0 THEN :avg_indexes_per_shard
+               ELSE COALESCE(
+                 (SELECT ceil(count(i.*)::numeric
+                              / NULLIF(count(DISTINCT p.logicalrelid), 0))::int
+                    FROM pg_dist_partition p
+                    LEFT JOIN pg_index i ON i.indrelid = p.logicalrelid
+                    WHERE p.partmethod IN ('h','r')), 1)
+          END, 1)                                                                    AS avg_idx_per_shard
 )
 SELECT f.*,
     -- payload components (bytes)
@@ -110,9 +140,40 @@ SELECT f.*,
      + n_shards::bigint*:k_shard_row + n_placements::bigint*:k_placement_row
      + n_dist_objects::bigint*:k_obj_row + n_fkeys::bigint*:k_fkey
      + n_schema_sharded::bigint*:k_schema_row)    AS payload_b,
-    -- lock-slot demand on candidate: worst-case one txn creates every shell +
-    -- partition + shard placement; divide by 64 and round up for lock-partition bucket
-    ((n_dist_tables + n_partitions + n_shards + n_ref_tables) * 2)::int AS lpt_needed_candidate_raw
+    -- ---- Lock-table demand on the candidate ----
+    -- One backend in a single transaction creates every shell table + its
+    -- indexes + every partition (+ its indexes) + reference tables, and
+    -- briefly locks catalog relations (10 slack for pg_dist_* catalogs).
+    -- peak_backend_locks = (dist_tables + ref_tables + partitions) * (1 + avg_idx)
+    --                    + 10
+    ( (n_dist_tables + n_ref_tables + n_partitions)::bigint
+        * (1 + f.avg_idx_per_shard) + 10
+    )                                               AS peak_backend_locks,
+    -- candidate hash capacity = lpt * (MaxBackends + mpx)
+    ( :candidate_max_lpt::bigint
+        * ( (:candidate_max_conn + :candidate_av_workers
+             + :candidate_wal_senders + :candidate_worker_procs)
+            + :candidate_max_prep )
+    )                                               AS candidate_hash_capacity,
+    -- required lpt on candidate for transactional mode
+    -- honest math: smallest integer lpt s.t. lpt * (MaxBackends + mpx) >= demand * safety
+    -- rounded UP to the nearest multiple of 64 for operational convenience
+    (CEIL( ( (n_dist_tables + n_ref_tables + n_partitions)::numeric
+              * (1 + f.avg_idx_per_shard) + 10 )
+           * :lock_safety_factor::numeric
+           / NULLIF((:candidate_max_conn + :candidate_av_workers
+                     + :candidate_wal_senders + :candidate_worker_procs
+                     + :candidate_max_prep)::numeric, 0)
+           / 64.0 )::int * 64
+    )                                               AS lpt_needed_candidate_raw,
+    -- will transactional add-node actually fail? true iff demand*safety > capacity
+    ( ( (n_dist_tables + n_ref_tables + n_partitions)::numeric
+         * (1 + f.avg_idx_per_shard) + 10 ) * :lock_safety_factor::numeric
+      > ( :candidate_max_lpt::bigint
+          * ( (:candidate_max_conn + :candidate_av_workers
+               + :candidate_wal_senders + :candidate_worker_procs)
+              + :candidate_max_prep ) )::numeric
+    )                                               AS lock_exhaustion_predicted
 FROM facts f;
 
 -- ---------------------------------------------------------------------
@@ -151,19 +212,28 @@ SELECT line FROM (
   UNION ALL SELECT 30, '' FROM _n6
   UNION ALL SELECT 31, '-- Candidate risk predictions --' FROM _n6
   UNION ALL SELECT 32,
-    format('Lock-slot demand (transactional) : %s slots per backend; candidate max_locks_per_transaction=%s -> %s',
-           lpt_needed_candidate_raw, :candidate_max_lpt,
-           CASE WHEN lpt_needed_candidate_raw > :candidate_max_lpt
-                THEN '*** WILL FAIL: out of shared memory; raise candidate.max_locks_per_transaction to ' || (((lpt_needed_candidate_raw/64)+1)*64)
-                ELSE 'OK' END) FROM _n6
+    format('Candidate hash capacity (planned): lpt(%s) * (MaxBackends(%s) + mpx(%s)) = %s slots',
+           :candidate_max_lpt,
+           (:candidate_max_conn + :candidate_av_workers + :candidate_wal_senders + :candidate_worker_procs),
+           :candidate_max_prep, candidate_hash_capacity) FROM _n6
   UNION ALL SELECT 33,
+    format('Peak locks held by ONE sync txn  : %s  (= (%s dist+%s ref+%s parts) * (1 + avg_idx=%s) + catalog slack)',
+           peak_backend_locks, n_dist_tables, n_ref_tables, n_partitions, avg_idx_per_shard) FROM _n6
+  UNION ALL SELECT 34,
+    format('Lock-slot feasibility (txnal)    : demand %s x safety(%s) vs capacity %s -> %s',
+           peak_backend_locks, :lock_safety_factor, candidate_hash_capacity,
+           CASE WHEN lock_exhaustion_predicted
+                THEN format('*** WILL FAIL: raise candidate.max_locks_per_transaction to %s', lpt_needed_candidate_raw)
+                ELSE format('OK (suggested lpt=%s at 64-slot granularity, planned %s)', lpt_needed_candidate_raw, :candidate_max_lpt)
+           END) FROM _n6
+  UNION ALL SELECT 35,
     format('Candidate backend peak mem (txnal): ~%s MB  (payload x1.5)  vs work_mem=%s MB, maintenance_work_mem=%s MB, RAM=%s MB',
            round(payload_b*1.5/1048576.0, 0),
            :candidate_work_mem_mb, :candidate_maint_mb, :candidate_ram_mb) FROM _n6
-  UNION ALL SELECT 34,
+  UNION ALL SELECT 36,
     format('Coordinator peak mem (txnal)     : ~%s MB  (materializes full command list before sending)',
            round(payload_b*2.0/1048576.0, 0)) FROM _n6
-  UNION ALL SELECT 35,
+  UNION ALL SELECT 37,
     format('Estimated wall time (any mode)   : ~%s sec  (payload %s MB over %s MB/s link)  vs citus.node_connection_timeout',
            round(payload_b/1048576.0 / NULLIF(:link_mbps,0), 1),
            round(payload_b/1048576.0, 2), :link_mbps) FROM _n6
@@ -191,9 +261,9 @@ SELECT line FROM (
   UNION ALL SELECT 50, '' FROM _n6
   UNION ALL SELECT 51, '-- Failure-signature predictions if you add a node AS-IS --' FROM _n6
   UNION ALL SELECT 52,
-    CASE WHEN lpt_needed_candidate_raw > :candidate_max_lpt
+    CASE WHEN lock_exhaustion_predicted
          THEN format('  * ERROR on candidate: "out of shared memory; You might need to increase max_locks_per_transaction" -- raise to %s before adding.',
-                     (((lpt_needed_candidate_raw/64)+1)*64))
+                     lpt_needed_candidate_raw)
          ELSE '  * Lock table: OK.' END FROM _n6
   UNION ALL SELECT 53,
     CASE WHEN payload_b*1.5/1048576.0 > :candidate_ram_mb * 0.25
@@ -220,9 +290,9 @@ SELECT line FROM (
   UNION ALL SELECT 61, '-- N6 headline --' FROM _n6
   UNION ALL SELECT 62,
     CASE
-      WHEN lpt_needed_candidate_raw > :candidate_max_lpt
-        THEN format('CRITICAL : add-node WILL fail on lock-slot exhaustion (needs %s, candidate has %s). Raise max_locks_per_transaction to %s before adding.',
-                    lpt_needed_candidate_raw, :candidate_max_lpt, (((lpt_needed_candidate_raw/64)+1)*64))
+      WHEN lock_exhaustion_predicted
+        THEN format('CRITICAL : add-node WILL fail on lock-slot exhaustion (demand %s x safety %s > capacity %s). Raise candidate max_locks_per_transaction to %s before adding.',
+                    peak_backend_locks, :lock_safety_factor, candidate_hash_capacity, lpt_needed_candidate_raw)
       WHEN payload_b >= 2 * 1024::bigint * 1048576
         THEN format('CRITICAL : sync payload %s MB >= 2 GB; add-node requires nontransactional mode + maintenance window.',
                     round(payload_b/1048576.0, 1))
@@ -238,8 +308,8 @@ SELECT line FROM (
       WHEN payload_b >= 50 * 1048576
         THEN format('WARN : payload %s MB is non-trivial; raise timeouts and lock budget before adding.',
                     round(payload_b/1048576.0,1))
-      ELSE format('OK : add-node is safe under current config (payload %s MB, lock-slot need %s <= %s).',
-                  round(payload_b/1048576.0,2), lpt_needed_candidate_raw, :candidate_max_lpt)
+      ELSE format('OK : add-node is safe under current config (payload %s MB, lock demand %s x %s <= capacity %s).',
+                  round(payload_b/1048576.0,2), peak_backend_locks, :lock_safety_factor, candidate_hash_capacity)
     END FROM _n6
 
   ORDER BY ord

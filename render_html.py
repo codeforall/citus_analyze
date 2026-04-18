@@ -23,6 +23,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 ADVISORS = [
+    ("M1",  "Node memory minimum (OOM-safety)"),
     ("GR1", "Shard / partition growth memory model"),
     ("C3",  "Max safe external connections (MX-aware)"),
     ("S3",  "Data skew across shards & workers"),
@@ -31,7 +32,7 @@ ADVISORS = [
     ("A3",  "2PC backlog & orphan prepared xacts"),
 ]
 
-SEV_RX = re.compile(r'^\s*\|?\s*(CRITICAL|WARN|OK)\s*:', re.M)
+SEV_RX = re.compile(r'^\s*\|?\s*(CRITICAL|WARN|INFO|OK)\s*:', re.M)
 
 CSS = """
 :root { --ok:#2e7d32; --warn:#ed6c02; --crit:#c62828; --fg:#222; --mut:#666;
@@ -48,6 +49,7 @@ h3 { margin-top: 1.5rem; color: var(--mut); font-weight: 600; }
 .badge.ok { background: var(--ok); }
 .badge.warn { background: var(--warn); }
 .badge.crit { background: var(--crit); }
+.badge.info { background: #1565c0; }
 .badge.unk { background: #777; }
 .summary { margin: 1.2rem 0 1.6rem; padding: 1rem 1.2rem;
            background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
@@ -86,12 +88,13 @@ def classify(line: str) -> str:
 
 def worst_verdict(text: str) -> tuple[str, str]:
     """Return (severity, line) — most severe match wins."""
-    order = ["CRITICAL", "WARN", "OK"]
+    order = ["CRITICAL", "WARN", "OK", "INFO"]
+    sev_map = {"CRITICAL":"crit","WARN":"warn","OK":"ok","INFO":"info"}
     for sev in order:
         m = re.search(rf'^\s*\|?\s*{sev}\s*:[^\n|]*', text, re.M)
         if m:
             line = m.group(0).lstrip().lstrip("|").strip().rstrip("|").strip()
-            return (sev.lower().replace("critical","crit"), line)
+            return (sev_map[sev], line)
     return ("unk", "(no verdict headline)")
 
 def parse_sections(gather_path: Path) -> list[tuple[str, str]]:
@@ -146,7 +149,8 @@ def render(run_dir: Path, out_path: Path) -> None:
             text, sev, line = "", "unk", f"(missing file: {aid}.out)"
         advisor_results.append((aid, title, sev, line, text))
         if sev == "crit" and overall != "crit": overall = "crit"
-        elif sev == "warn" and overall == "ok": overall = "warn"
+        elif sev == "warn" and overall not in ("crit",): overall = "warn"
+        # INFO and OK do not escalate overall
 
     sections = parse_sections(run_dir / "gather.out")
     summary_txt = (run_dir / "summary.txt").read_text(errors="replace") if (run_dir / "summary.txt").exists() else ""
@@ -167,7 +171,7 @@ def render(run_dir: Path, out_path: Path) -> None:
              f'<span class="badge {overall}">{ov_label}</span></h2>')
     H.append('<table><thead><tr><th>Severity</th><th>ID</th><th>Advisor</th><th>Headline</th></tr></thead><tbody>')
     for aid, title, sev, line, _ in advisor_results:
-        lbl = {"ok":"OK","warn":"WARN","crit":"CRITICAL","unk":"?"}[sev]
+        lbl = {"ok":"OK","warn":"WARN","crit":"CRITICAL","info":"INFO","unk":"?"}[sev]
         H.append(f'<tr><td><span class="badge {sev}">{lbl}</span></td>'
                  f'<td><code>{aid}</code></td>'
                  f'<td>{html.escape(title)}</td>'
@@ -187,7 +191,7 @@ def render(run_dir: Path, out_path: Path) -> None:
     # Advisors
     H.append('<h2>Advisors</h2>')
     for aid, title, sev, line, text in advisor_results:
-        lbl = {"ok":"OK","warn":"WARN","crit":"CRITICAL","unk":"?"}[sev]
+        lbl = {"ok":"OK","warn":"WARN","crit":"CRITICAL","info":"INFO","unk":"?"}[sev]
         H.append(f'<h3 id="adv-{aid}"><span class="badge {sev}">{lbl}</span> '
                  f'<span class="tag">{aid}</span> {html.escape(title)}</h3>')
         H.append(f'<p class="headline">{html.escape(line)}</p>')
