@@ -235,6 +235,64 @@ def _rec_cp1(text: str) -> str:
 
 
 
+def _rec_w1(text: str) -> str:
+    if re.search(r'fsync or full_page_writes is OFF', text):
+        return 'set fsync=on and full_page_writes=on immediately'
+    if re.search(r'archive_mode is on but archiving is broken', text):
+        return 'fix archive_command / archive_library destination'
+    m = re.search(r'(\d+) node\(s\) have >= \d+% requested checkpoints', text)
+    if m:
+        return f'raise max_wal_size on {m.group(1)} node(s) to shift checkpoints to timed'
+    m = re.search(r'(\d+) node\(s\) have wal_buffers < (\d+) MB', text)
+    if m:
+        return f'raise wal_buffers to >= {m.group(2)} MB on {m.group(1)} node(s)'
+    if re.search(r'archiver has a recent failure', text):
+        return 'investigate archiver destination (W1d)'
+    return 'WAL path healthy'
+
+
+def _rec_stat1(text: str) -> str:
+    m = re.search(r'(\d+) distributed table\(s\) have NO analyzed shards', text)
+    if m:
+        return f'run ANALYZE on {m.group(1)} distributed table(s)'
+    m = re.search(r'(\d+) distributed table\(s\) have shard analyze older than (\d+) days', text)
+    if m:
+        return f're-ANALYZE {m.group(1)} table(s) older than {m.group(2)}d'
+    m = re.search(r'(\d+) distributed table\(s\) have some un-analyzed shards', text)
+    if m:
+        return f'ANALYZE {m.group(1)} table(s): plans differ across workers'
+    m = re.search(r'(\d+) distributed table\(s\) have shards older than (\d+) days', text)
+    if m:
+        return f'schedule ANALYZE for {m.group(1)} table(s) stale >{m.group(2)}d'
+    m = re.search(r'(\d+) distributed table\(s\) have >= (\d+)% churn', text)
+    if m:
+        return f'{m.group(1)} table(s) with >={m.group(2)}% churn: ANALYZE'
+    if re.search(r'default_statistics_target too low', text):
+        return 'raise default_statistics_target on flagged node(s)'
+    return 'statistics fresh'
+
+
+def _rec_sec1(text: str) -> str:
+    m = re.search(r'(\d+) role\(s\) missing on some cluster nodes', text)
+    if m:
+        return f'pre-create {m.group(1)} role(s) on missing nodes or enable role propagation'
+    m = re.search(r'(\d+) extension\(s\) at different versions', text)
+    if m:
+        return f'ALTER EXTENSION UPDATE for {m.group(1)} extension(s)'
+    m = re.search(r'(\d+) superuser role\(s\) \(> (\d+) allowed\)', text)
+    if m:
+        return f'reduce superusers from {m.group(1)} (> {m.group(2)} allowed)'
+    if re.search(r'password_encryption is not scram-sha-256', text):
+        return 'set password_encryption=scram-sha-256 cluster-wide'
+    if re.search(r'login role\(s\) with md5 / missing password', text):
+        return 'reset passwords to scram-sha-256, set passwords on all login roles'
+    if re.search(r'pg_hba rules use trust or plain password', text):
+        return 'replace trust/password rules with scram-sha-256 in pg_hba'
+    if re.search(r'inter-node traffic may be unencrypted', text):
+        return 'enable ssl and set sslmode=require in citus.node_conninfo'
+    return 'auth posture healthy'
+
+
 def _rec_ref1(text: str) -> str:
     if re.search(r'no reference tables defined', text):
         return 'no reference tables'
@@ -250,6 +308,34 @@ def _rec_ref1(text: str) -> str:
     if re.search(r'extra placements', text):
         return 'run citus_cleanup_orphaned_resources() to remove extra placements'
     return 'reference tables healthy'
+
+
+def _rec_net1(text: str) -> str:
+    m = re.search(r'(\d+) connectivity edge\(s\) failed', text)
+    if m:
+        return f'fix {m.group(1)} broken edge(s) in cluster mesh (pg_hba/firewall/citus.node_conninfo)'
+    if re.search(r'at least one node unreachable', text):
+        return 'one or more nodes dropped during sampling -- investigate'
+    m = re.search(r'at least one node has avg RTT > (\d+) ms', text)
+    if m:
+        return f'investigate network path (RTT > {m.group(1)} ms)'
+    return 'mesh healthy'
+
+
+def _rec_rep1(text: str) -> str:
+    m = re.search(r'replay_lag exceeds (\d+) s', text)
+    if m:
+        return f'investigate standby: replay_lag >= {m.group(1)}s'
+    m = re.search(r'inactive replication slot\(s\) retain >= (\d+) MB', text)
+    if m:
+        return f'drop inactive slots or revive subscribers ({m.group(1)} MB retained)'
+    if re.search(r'synchronous_standby_names set without matching', text):
+        return 'verify sync standby is connected or clear synchronous_standby_names'
+    if re.search(r'orphaned Citus rebalancer replication slot', text):
+        return 'investigate pg_dist_cleanup and drop orphan slots'
+    if re.search(r'no replication senders or slots configured', text):
+        return 'no HA configured (informational)'
+    return 'replication healthy'
 
 
 def _rec_r2(text: str) -> str:
@@ -300,6 +386,21 @@ ADVISORS = [
     ("REF1", "Reference-table health",
      "Per-reference-table inventory, oversize warnings, placement count mismatches, size drift across workers.",
      _rec_ref1),
+    ("W1",   "WAL & checkpoint pressure",
+     "Per-node wal_buffers, max_wal_size, checkpoint trigger mix (timed vs requested), archiver health, replication slots, durability GUCs (fsync, full_page_writes).",
+     _rec_w1),
+    ("STAT1","Statistics freshness",
+     "Per-shard last_analyze/last_autoanalyze drift, tables with significant churn since ANALYZE, never-analyzed tables, extended-stats suggestions, default_statistics_target sanity.",
+     _rec_stat1),
+    ("SEC1", "Security & role audit",
+     "Superuser inventory, password hash methods (scram vs md5 vs none), role drift across nodes (MX blocker), per-node security GUCs, PUBLIC grants on distributed tables, extension version drift, weak pg_hba rules.",
+     _rec_sec1),
+    ("NET1", "Node reachability & latency",
+     "Full NxN connectivity matrix from citus_check_cluster_node_health(), asymmetric-edge detection (A->B ok, B->A fails), coord->node RTT sampling with per-node verdict vs cluster median.",
+     _rec_net1),
+    ("REP1", "Streaming replication & slot lag",
+     "Per-node pg_stat_replication senders (state / sync_state / replay_lag), replication slots with WAL retention bytes, orphan Citus rebalancer slots, recovery state, synchronous_commit vs synchronous_standby_names sanity.",
+     _rec_rep1),
     ("GR1", "Shard / partition growth memory model",
      "Per-backend cache growth + PG lock-hash capacity (lpt × (MaxBackends + mpx)).",
      _rec_gr1),

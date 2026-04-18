@@ -147,6 +147,11 @@ ADVISORS=(
   "CP1:pgbouncer pool sizing:advisors/cp1_pgbouncer_pool.sql"
   "R2:Rebalance plan preview:advisors/r2_rebalance_preview.sql"
   "REF1:Reference-table health:advisors/ref1_reference_table_health.sql"
+  "W1:WAL & checkpoint pressure:advisors/w1_wal_checkpoint.sql"
+  "STAT1:Statistics freshness:advisors/stat1_stats_freshness.sql"
+  "SEC1:Security & role audit:advisors/sec1_security_audit.sql"
+  "NET1:Node reachability & latency:advisors/net1_node_reachability.sql"
+  "REP1:Streaming replication & slot lag:advisors/rep1_replication_lag.sql"
   "GR1:Shard/partition growth memory model:advisors/gr1_shard_growth_advisor.sql"
   "C3:Max safe external connections (MX-aware):advisors/c3_max_external_connections.sql"
   "S3:Data skew across shards & workers:advisors/s3_data_skew_advisor.sql"
@@ -242,7 +247,7 @@ badge() {
         1) echo "  OVERALL: WARN - at least one advisor returned WARN.";;
         2) echo "  OVERALL: CRITICAL - at least one advisor returned CRITICAL.";;
     esac
-    echo "  Full per-advisor output: $OUT_DIR/{M1,D1,Q1,GUC1,V1,P1,I1,B1,CP1,R2,REF1,GR1,C3,S3,R1,N6,A3}.out"
+    echo "  Full per-advisor output: $OUT_DIR/{M1,D1,Q1,GUC1,V1,P1,I1,B1,CP1,R2,REF1,W1,STAT1,SEC1,NET1,REP1,GR1,C3,S3,R1,N6,A3}.out"
     echo "  Raw cluster snapshot:    $GATHER_OUT"
     echo
 } | tee -a "$SUMMARY"
