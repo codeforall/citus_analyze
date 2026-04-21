@@ -145,7 +145,7 @@ Environment variables:
   When the server requires password authentication and none is cached,
   citus_analyze prompts once and reuses the value for every advisor.
 
-Report bugs at: https://github.com/<your-org>/citus_analyze/issues
+Report bugs at: https://github.com/codeforall/citus_analyze/issues
 EOF
     exit "$rc"
 }
