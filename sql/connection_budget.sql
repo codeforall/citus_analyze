@@ -3,6 +3,7 @@
 \if :{?cached_connections_per_peer} \else \set cached_connections_per_peer 0 \endif
 \if :{?overhead_per_node} \else \set overhead_per_node 0 \endif
 \if :{?headroom_pct} \else \set headroom_pct 80 \endif
+\ir client_limit.sql
 
 DROP TABLE IF EXISTS pg_temp._connections_raw;
 CREATE TEMP TABLE _connections_raw AS
@@ -14,6 +15,8 @@ SELECT * FROM run_command_on_all_nodes($CMD$
     'shared_pool', current_setting('citus.max_shared_pool_size', true)::int,
     'adaptive_pool', current_setting('citus.max_adaptive_executor_pool_size', true)::int,
     'max_client_connections', current_setting('citus.max_client_connections', true),
+    'client_limit_default', (SELECT boot_val FROM pg_settings WHERE name='citus.max_client_connections'),
+    'citus_version', current_setting('citus.version', true),
     'observed_clients', (SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend'
         AND pid <> pg_backend_pid() AND application_name !~* '^citus'),
     'observed_internal', (SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend'
@@ -27,7 +30,8 @@ WITH settings AS (
   SELECT node.*, raw.result::jsonb AS config
   FROM _connections_raw raw JOIN pg_dist_node node USING (nodeid) WHERE raw.success
 )
-SELECT *, groupid = 0 OR hasmetadata AS is_entry,
+SELECT settings.*, limits.client_limit, limits.client_limit_status,
+       groupid = 0 OR hasmetadata AS is_entry,
        (config->>'observed_clients')::int AS observed_clients,
        (config->>'observed_internal')::int AS observed_internal,
        greatest(0, (config->>'max_connections')::int - (config->>'superuser_reserved')::int
@@ -37,7 +41,8 @@ SELECT *, groupid = 0 OR hasmetadata AS is_entry,
             ELSE NULL END AS shared_pool_per_peer,
        CASE WHEN :connection_sessions_per_entry::int < 0 THEN (config->>'observed_clients')::int
             ELSE :connection_sessions_per_entry::int END AS scenario_sessions
-FROM settings;
+FROM settings
+CROSS JOIN LATERAL pg_temp.citus_client_limit(config->>'max_client_connections') limits;
 
 DROP TABLE IF EXISTS pg_temp._connection_edges;
 CREATE TEMP TABLE _connection_edges AS
@@ -54,16 +59,21 @@ CREATE TEMP TABLE _connection_budget AS
 SELECT node.*,
        coalesce((SELECT sum(requested) FROM _connection_edges WHERE target_id=node.nodeid), 0) AS requested_fanin,
        coalesce((SELECT sum(throttled) FROM _connection_edges WHERE target_id=node.nodeid), 0) AS throttled_fanin,
+       CASE WHEN client_limit_status <> 'unknown' THEN
          greatest(0, least(floor(available_slots * :headroom_pct::numeric / 100)
            - coalesce((SELECT sum(requested) FROM _connection_edges WHERE target_id=node.nodeid), 0),
-           CASE WHEN (config->>'max_client_connections')::int > 0
-            THEN (config->>'max_client_connections')::int END)) AS external_budget
+           client_limit)) END AS external_budget
 FROM _connection_nodes node;
 
 \ir advisor_coverage.sql
+
+SELECT nodename || ':' || nodeport AS node,
+       'INCOMPLETE : Citus client limit is unavailable or unrecognized; application connection capacity is unknown' AS finding
+FROM _connection_nodes WHERE client_limit_status='unknown';
 
 SELECT 'INCOMPLETE : invalid connection scenario inputs' AS finding
 WHERE :connections_per_session::numeric < 0 OR :cached_connections_per_peer::numeric < 0
    OR :headroom_pct::numeric <= 0 OR :headroom_pct::numeric > 100 OR :overhead_per_node::int < 0
    OR :connection_sessions_per_entry::int < -1;
 \echo 'INFO : scenario only, not a certified concurrency ceiling. Each source can open multiple connections per target. Cached pools, uneven routing, repartition queries, local execution and application-specific limits require measurement. Zero shared_pool means automatic max_connections; -1 disables throttling. Client classification uses application_name and may be incomplete.'
+\echo 'INFO : citus.max_client_connections is a per-server cap on external connections across databases for regular clients: 0 blocks them, -1 disables the cap, positive values set the cap. This differs from shared_pool automatic behavior. Internal Citus connections do not use the client cap; superusers are exempt from rejection but external administrative sessions still count. Budgets are shared by all applications, not per application.'

@@ -18,16 +18,21 @@ WITH budgets AS (
                     / nullif(:pool_groups::numeric * :pooler_instances::numeric, 0)) AS demand
   FROM _connection_budget WHERE is_entry
 ), pools AS (
-  SELECT *, greatest(0, least(demand, floor(group_budget / (1 + :reserve_pct::numeric / 100)))) AS pool_size
+  SELECT *, CASE WHEN group_budget IS NOT NULL
+                 THEN greatest(0, least(demand, floor(group_budget / (1 + :reserve_pct::numeric / 100)))) END AS pool_size
   FROM budgets
 )
-SELECT nodename || ':' || nodeport AS entry_node, external_budget,
+SELECT nodename || ':' || nodeport AS entry_node, external_budget, client_limit, client_limit_status,
        :pool_groups::int AS database_user_pairs, :pooler_instances::int AS pooler_instances,
        CASE WHEN group_budget IS NOT NULL THEN pool_size END AS pool_size,
        CASE WHEN group_budget IS NOT NULL THEN floor(pool_size * :reserve_pct::numeric / 100) END AS reserve_pool_size,
        CASE WHEN group_budget IS NOT NULL THEN (pool_size + floor(pool_size * :reserve_pct::numeric / 100))
             * :pool_groups::int * :pooler_instances::int END AS all_pools_including_reserve,
-       CASE WHEN :pool_groups::int <= 0 THEN 'INFO : supply actual pool_groups before calculating pool sizes'
+        CASE WHEN scenario_sessions > external_budget OR observed_clients > external_budget
+          THEN 'WARN : proposed or observed application connections exceed the external connection budget; review the Citus client limit and internal demand'
+            WHEN client_limit_status='unknown'
+            THEN 'INCOMPLETE : pool sizes cannot be calculated without a known Citus client limit'
+          WHEN :pool_groups::int <= 0 THEN 'INFO : supply actual pool_groups before calculating pool sizes'
             WHEN :pooler_instances::int <= 0 OR :reserve_pct::numeric < 0 OR :surge_factor::numeric < 0
             THEN 'INCOMPLETE : invalid pool scenario inputs'
             WHEN demand > pool_size THEN 'WARN : desired pool exceeds allocated backend budget; queueing or workload changes required'

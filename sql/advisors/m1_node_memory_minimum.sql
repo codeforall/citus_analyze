@@ -1,5 +1,6 @@
 \set advisor_id M1
 \ir ../capabilities.sql
+\ir ../client_limit.sql
 -- M1: per-node memory scenarios, not an RSS measurement or an OOM prediction.
 -- MiB inputs; -1 means use the observed concurrency (not a peak estimate).
 \pset pager off
@@ -40,6 +41,9 @@ SELECT * FROM run_command_on_all_nodes($CMD$
     'parallel', least(current_setting('max_parallel_workers')::int, current_setting('max_worker_processes')::int),
     'per_gather', current_setting('max_parallel_workers_per_gather')::int,
     'max_connections', current_setting('max_connections')::int,
+    'max_client_connections', current_setting('citus.max_client_connections', true),
+    'client_limit_default', (SELECT boot_val FROM pg_settings WHERE name='citus.max_client_connections'),
+    'citus_version', current_setting('citus.version', true),
     'reserved_connections', current_setting('superuser_reserved_connections')::int
       + coalesce(current_setting('reserved_connections', true), '0')::int,
     'database_mib', pg_database_size(current_database()) / 1048576.0,

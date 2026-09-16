@@ -163,6 +163,8 @@ together; they use the same memory.
 | --- | --- | --- |
 | `m1_capacity_active_pct` | Percentage of connections running queries at once when estimating the connection limit. | 100 (all busy) |
 | `m1_capacity_headroom_pct` | Percentage of provided RAM left unused for this planning estimate, before the OS reserve. | 20 |
+| `m1_internal_connections` | Peak database connections reserved for incoming/internal Citus work when calculating application capacity. | Unknown (-1) |
+| `m1_other_client_connections` | External connections outside the application being sized, including administrative sessions. | 0 |
 | `m1_growth_cache_pct` | Percentage of distributed data you expect to keep in memory. Required for table/shard growth. | Unknown |
 | `m1_growth_shard_mb` | On-disk MiB per new shard, including indexes. | Average of current distributed shard copies |
 | `m1_growth_shards_per_table` | Shards per new distributed table. | Current average, rounded up |
@@ -206,14 +208,61 @@ The SQL source is [sql/memory_capacity.sql](sql/memory_capacity.sql). Its struct
 results are available under `analysis` in M1's JSON output. Older report bundles
 must be collected again to obtain these numbers.
 
+M1 keeps **total database capacity** separate from **application-client capacity**.
+The second figure is for regular, non-superuser clients and is calculated as:
+
+```text
+application limit = max(0, min(
+  total memory/PG-slot limit - internal allowance - other-client allowance,
+  effective Citus client cap - other-client allowance
+))
+```
+
+When the Citus cap is disabled, only the first bound applies. The total limit
+already accounts for PostgreSQL reserved slots and memory buffers. These are
+total application connections, not extra connections above current usage.
+Without a whole-number internal allowance or a known Citus client-cap state,
+the application estimate remains unknown while the total memory estimate can
+still be shown. For example, add `--advisor-var=m1_internal_connections=80`
+and `--advisor-var=m1_other_client_connections=5` using your measured peak needs.
+Allowances apply to each node; differing per-node workloads need separate runs
+or a conservative common allowance. Internal connections can grow with client
+traffic, so validate this fixed allowance against C3/MX1 and a load test.
+
+M1 JSON includes `application_connection_limit`, `citus_client_setting`,
+`citus_client_default`, `citus_client_limit`, `citus_client_limit_status`,
+`internal_connection_allowance` and `other_client_allowance` for every node.
+An unknown application limit does not invalidate otherwise available memory data.
+
 ### Connections And Pooling
 
 C3, MX1 and CP1 share [sql/connection_budget.sql](sql/connection_budget.sql).
 It models source sessions, connections per session/target, cached connections,
-per-peer throttling, backend reservations and positive Citus client limits.
-Non-MX shard targets still receive fan-in. Routing and pool behavior are scenarios,
-not certified safe concurrency ceilings. Verify any automatic/version-specific
-client-limit semantics independently.
+per-peer throttling, backend reservations and effective Citus client limits.
+Non-MX shard targets still receive fan-in. C3 and MX1 warn when proposed/observed
+external demand exceeds the resulting budget; CP1 uses it for pool sizing and
+includes reserve pools. Missing client-limit data produces INCOMPLETE rather
+than an unlimited budget. Routing and pool behavior remain planning scenarios,
+not certified safe concurrency ceilings.
+
+The shared resolver is [sql/client_limit.sql](sql/client_limit.sql):
+
+| `citus.max_client_connections` | Interpretation |
+| --- | --- |
+| Positive integer | Per-server external-client cap, shared by all databases/applications. |
+| `0` | No regular client connections allowed. **Not automatic.** |
+| `-1` | Citus client cap disabled; PostgreSQL limits still apply. Also the verified upstream default. |
+| Missing, unrecognized, or less than `-1` | Unknown; do not assume unlimited. |
+
+These semantics are verified in upstream Citus 13.3's
+[setting registration and authentication hook](https://github.com/citusdata/citus/blob/v13.3.0/src/backend/distributed/shared_library_init.c)
+and tested against the local Citus 15.0devel build. This is different from
+`citus.max_shared_pool_size=0`, which selects an automatic pool size.
+Internal Citus connections do not count against the external cap. Superusers
+are exempt from rejection, but external administrative sessions still contribute
+to the external count. The advisors budget for ordinary application roles, not
+superuser exceptions. They record the value/default seen by collection sessions;
+provider or role-specific behavior still needs validation for that deployment.
 
 CP1 needs actual `(database,user)` pool groups and pooler-instance counts. Its
 budget includes reserve pools; desired demand can be lower than the maximum

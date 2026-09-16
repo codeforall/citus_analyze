@@ -34,7 +34,43 @@ def capacity_summary(result):
     if len(limits) != len(result['nodes']) or not limits:
         return 'Provide RAM and valid workload inputs for every server to estimate capacity.'
     span = _number(min(limits)) if min(limits) == max(limits) else f'{_number(min(limits))} to {_number(max(limits))}'
-    return f'Memory-only planning limit: {span} total database connections per server, with {_number(result.get("active_pct"))}% busy at once. Check each server below and confirm with a load test.'
+    application_limits = [node['application_connection_limit'] for node in result['nodes']
+                          if node.get('application_connection_limit') is not None]
+    if len(application_limits) == len(result['nodes']):
+        application_span = _number(min(application_limits)) if min(application_limits) == max(application_limits) else f'{_number(min(application_limits))} to {_number(max(application_limits))}'
+        application = f'Application-client limit after allowances and the Citus cap: {application_span} per server.'
+    else:
+        application = 'Application-client capacity is not fully assessed; see the separate limits below.'
+    return (f'Memory-only planning limit: {span} total database connections per server, with {_number(result.get("active_pct"))}% busy at once. '
+            f'{application} Confirm both with a load test.')
+
+
+def render_application_capacity(nodes):
+    parts = ['<h3>Application-client capacity</h3>',
+             '<p>This is a separate limit for regular (non-superuser) application connections. '
+             'It takes the lower of the Citus client cap and the database capacity left after internal work and other clients. '
+             'The Citus cap is shared across all databases on each server.</p>',
+             '<div class="scroll"><table class="memory-table"><thead><tr><th>Server</th>'
+             '<th>Citus setting</th><th>Effective client cap</th><th>Internal allowance</th>'
+             '<th>Other-client allowance</th><th>Application-client limit</th></tr></thead><tbody>']
+    for node in nodes:
+        state = node.get('citus_client_limit_status', 'unknown')
+        effective = 'No Citus cap' if state == 'disabled' else _number(node.get('citus_client_limit')) if state in ('limited', 'blocked') else 'Unknown'
+        columns = [node['server'], str(node.get('citus_client_setting')) if node.get('citus_client_setting') is not None else 'Unknown',
+                   effective, _number(node.get('internal_connection_allowance')),
+                   _number(node.get('other_client_allowance')), _number(node.get('application_connection_limit'))]
+        parts.append('<tr>' + ''.join(f'<td>{html.escape(value)}</td>' for value in columns) + '</tr>')
+    parts.append('</tbody></table></div>')
+    if any(node.get('application_connection_limit') is None for node in nodes):
+        parts.append('<p><strong>Application capacity not fully estimated.</strong> Provide a whole-number peak internal-connection allowance '
+                     'and resolve missing or unrecognized Citus settings. Older bundles need a new memory check.</p>')
+    parts.append('<p>For <code>citus.max_client_connections</code>, <strong>0 blocks regular clients</strong> and '
+                 '<strong>-1 disables the Citus cap</strong>; neither means an automatic client limit. '
+                 'Superusers are exempt from rejection, but external administrative sessions still count toward the client total. '
+                 'Use <code>m1_internal_connections</code> for peak internal work and <code>m1_other_client_connections</code> '
+                 'for connections outside this application. Internal work can grow with application traffic: validate the allowance '
+                 'against C3/MX1 and peak load. These are total application limits, not additional clients.</p>')
+    return '\n'.join(parts)
 
 
 def render_capacity(result, complete=True):
@@ -66,6 +102,7 @@ def render_capacity(result, complete=True):
     if result.get('cache_pct') is None:
         parts.append('<p>No separate data-cache target was provided. The connection estimate includes configured shared memory and the other stated allowances, '
                      'but unmeasured file-cache or application memory needs may reduce it.</p>')
+    parts.append(render_application_capacity(nodes))
     parts.append('<h3>More tables or shards with the same workload</h3>')
     shards, tables = result.get('cluster_extra_shards'), result.get('cluster_extra_tables')
     if shards is None or tables is None:

@@ -219,7 +219,8 @@ class SqlTests(unittest.TestCase):
                                  '--coord-ram-mb=2000', '--worker-ram-mb=2000',
                                  '--advisor-var=m1_peak_connected=10', '--advisor-var=m1_peak_active=2',
                                  '--advisor-var=m1_capacity_active_pct=50', '--advisor-var=m1_growth_cache_pct=25',
-                                 '--advisor-var=m1_growth_shard_mb=256'],
+                                 '--advisor-var=m1_growth_shard_mb=256',
+                                 '--advisor-var=m1_internal_connections=4', '--advisor-var=m1_other_client_connections=2'],
                                 capture_output=True, text=True, env=self.env, timeout=180)
         self.assertEqual(result.returncode, 0, result.stdout[-4000:] + result.stderr[-3000:])
         self.assertEqual(len(list(output_dir.glob('*.json'))), 25)
@@ -227,6 +228,9 @@ class SqlTests(unittest.TestCase):
         self.assertIn('Memory and room to grow', html)
         self.assertTrue('additional similar distributed table' in html, 'Expected a visible table-growth estimate')
         self.assertIsNotNone(json.loads((output_dir / 'M1.json').read_text())['analysis']['cluster_extra_shards'])
+        self.assertIn('Application-client capacity', html)
+        for node in json.loads((output_dir / 'M1.json').read_text())['analysis']['nodes']:
+            self.assertEqual(node['application_connection_limit'], max(0, node['connection_limit'] - 6))
         if os.environ.get('CITUS_TEST_REPORT'):
             print('Fixture report:', output_dir / 'report.html')
         for wrong in ('WILL OOM', 'ROLLBACK PREPARED each', 'RTT > 50', 'no HA configured', 'Cost model is lying'):

@@ -3,6 +3,8 @@
 \if :{?m1_growth_cache_pct} \else \set m1_growth_cache_pct -1 \endif
 \if :{?m1_growth_shard_mb} \else \set m1_growth_shard_mb -1 \endif
 \if :{?m1_growth_shards_per_table} \else \set m1_growth_shards_per_table -1 \endif
+\if :{?m1_internal_connections} \else \set m1_internal_connections -1 \endif
+\if :{?m1_other_client_connections} \else \set m1_other_client_connections 0 \endif
 
 DROP TABLE IF EXISTS pg_temp._m1_data;
 CREATE TEMP TABLE _m1_data (nodeid int, distributed_mib numeric, local_copies numeric);
@@ -51,7 +53,10 @@ WITH layout AS (
   LEFT JOIN pg_dist_shard shard ON shard.logicalrelid=relation.oid
   WHERE partition.partmethod IN ('h','r','a') AND relation.relkind <> 'p'
 ), source AS (
-  SELECT model.*, layout.*, data.distributed_mib, data.local_copies,
+    SELECT model.*, layout.*, data.distributed_mib, data.local_copies,
+      client.client_limit, client.client_limit_status,
+      :m1_internal_connections::numeric AS internal_connection_allowance,
+      :m1_other_client_connections::numeric AS other_client_allowance,
          (SELECT count(*) FROM pg_dist_placement placement JOIN pg_dist_shard shard USING (shardid)
           JOIN pg_dist_partition partition ON partition.logicalrelid=shard.logicalrelid
           JOIN pg_class relation ON relation.oid=partition.logicalrelid
@@ -71,6 +76,7 @@ WITH layout AS (
          (SELECT count(*) FROM pg_dist_node node WHERE node.isactive AND node.noderole='primary'
              AND NOT EXISTS (SELECT 1 FROM _m1_data measured WHERE measured.nodeid=node.nodeid)) AS missing_size_nodes
   FROM _m1_calc model CROSS JOIN layout LEFT JOIN _m1_data data USING (nodeid)
+  CROSS JOIN LATERAL pg_temp.citus_client_limit(model.settings->>'max_client_connections') client
 ), costs AS (
   SELECT *, least(planning_ram_mib - :os_reserve_mb::numeric,
                   planning_ram_mib / nullif(1 + :os_reserve_pct::numeric / 100, 0)) AS budget_mib,
@@ -128,6 +134,12 @@ WITH RECURSIVE search(nodeid, low, high) AS (
   SELECT nodeid, low AS connection_limit FROM search WHERE high-low=1
 )
 SELECT input.*, limits.connection_limit,
+   CASE WHEN limits.connection_limit IS NOT NULL AND client_limit_status <> 'unknown'
+      AND internal_connection_allowance >= 0 AND other_client_allowance >= 0
+      AND internal_connection_allowance=floor(internal_connection_allowance)
+      AND other_client_allowance=floor(other_client_allowance)
+    THEN greatest(0, least(limits.connection_limit-internal_connection_allowance-other_client_allowance,
+               client_limit-other_client_allowance)) END AS application_connection_limit,
       CASE WHEN limits.connection_limit IS NOT NULL THEN greatest(0, limits.connection_limit-connected) END AS extra_connections,
        CASE WHEN inputs_valid AND missing_size_nodes=0 AND shards>0 AND tables>0
                   AND :m1_peak_connected::numeric > 0 AND :m1_peak_active::numeric >= 0
@@ -144,6 +156,8 @@ SELECT nodename || ':' || nodeport AS server,
        round((settings->>'database_mib')::numeric / 1024, 2) AS database_on_disk_gib,
        round(supplied_ram_mib / 1024, 2) AS provided_ram_gib,
        connection_limit AS total_connections_within_budget,
+      client_limit AS effective_citus_client_cap, client_limit_status,
+      application_connection_limit AS application_clients_within_budget,
        extra_connections AS more_than_selected_workload,
        extra_shards AS additional_cluster_shards,
        extra_tables AS additional_cluster_tables,
@@ -155,6 +169,14 @@ SELECT nodename || ':' || nodeport AS server,
 FROM _m1_capacity ORDER BY groupid, nodeport;
 SELECT format('INFO : connection estimate assumes %s%% busy at once and leaves %s%% of RAM unused, plus the operating-system reserve.',
               :m1_capacity_active_pct::numeric, :m1_capacity_headroom_pct::numeric) AS planning_assumptions;
+SELECT format('INFO : %s: total database limit=%s; application-client estimate=%s; Citus client setting=%s (%s). Internal allowance=%s; other-client allowance=%s.',
+              nodename || ':' || nodeport, coalesce(connection_limit::text, 'unknown'),
+              coalesce(application_connection_limit::text, 'not estimated'),
+              coalesce(settings->>'max_client_connections', 'unknown'), client_limit_status,
+              CASE WHEN internal_connection_allowance < 0 THEN 'not provided' ELSE internal_connection_allowance::text END,
+              other_client_allowance) AS application_planning
+FROM _m1_capacity ORDER BY groupid, nodeport;
+\echo 'INFO : application estimates are for regular (non-superuser) clients. Provide m1_internal_connections as a peak allowance for incoming/internal Citus database sessions and m1_other_client_connections for clients outside this application, including administration. All databases share the cap. Values 0 and -1 for citus.max_client_connections mean blocked and disabled respectively, not automatic. Missing settings or allowances leave application capacity unknown. Keep the allowance large enough for future distributed fan-out; C3/MX1 also need review.'
 \echo 'INFO : connections include application and internal database sessions, not concurrent application users. CPU, disk, locks and inter-server connection limits may be reached first. Default: all connections busy, plus 20% of RAM left unused for growth planning in addition to the operating-system reserve. Selected percentages are printed below.'
 \echo 'INFO : table/shard growth keeps the selected connection and query workload fixed, assumes new shards match the selected average size/index count and placement pattern, and reserves extra data-cache memory separately. More connections and more tables are alternatives, not allowances that can be added together. This is not an exact point where memory runs out.'
 
@@ -179,6 +201,13 @@ SELECT 'M1_CAPACITY_JSON=' || jsonb_build_object(
     'current_tables', tables, 'current_shards', shards,
     'new_shard_mib', round(new_shard_mib, 2), 'new_table_shards', new_table_shards,
     'connection_limit', connection_limit, 'connection_slots', connection_slots,
+    'application_connection_limit', application_connection_limit,
+    'citus_client_setting', settings->>'max_client_connections',
+    'citus_client_default', settings->>'client_limit_default',
+    'citus_version', settings->>'citus_version',
+    'citus_client_limit', client_limit, 'citus_client_limit_status', client_limit_status,
+    'internal_connection_allowance', CASE WHEN internal_connection_allowance >= 0 THEN internal_connection_allowance END,
+    'other_client_allowance', other_client_allowance,
     'extra_connections', extra_connections, 'extra_shards', extra_shards, 'extra_tables', extra_tables,
     'inputs_valid', inputs_valid,
     'limiting_factor', CASE WHEN connection_limit IS NULL THEN 'unknown'
