@@ -1,3 +1,5 @@
+\set advisor_id Q1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / Q1 : long-running queries & lock-wait snapshot
 -- ---------------------------------------------------------------------
@@ -59,7 +61,7 @@
 -- Each node returns a JSON array (one object per suspect session) so
 -- the coordinator can un-nest without pipe-splitting.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _q1_raw;
+DROP TABLE IF EXISTS pg_temp._q1_raw;
 CREATE TEMP TABLE _q1_raw (
     nodeid  int,
     success boolean,
@@ -89,7 +91,6 @@ external_suspect AS (
   ORDER BY GREATEST(
       EXTRACT(EPOCH FROM now() - COALESCE(xact_start, query_start, state_change))::bigint,
       0) DESC
-  LIMIT 50          -- bound per-node payload even on sick clusters
 ),
 internal_excluded AS (
   SELECT count(*)::int                                       AS n,
@@ -112,7 +113,7 @@ SELECT jsonb_build_object(
       'query_age_sec',    EXTRACT(EPOCH FROM now() - query_start)::bigint,
       'xact_age_sec',     EXTRACT(EPOCH FROM now() - xact_start)::bigint,
       'state_age_sec',    EXTRACT(EPOCH FROM now() - state_change)::bigint,
-      'query',            left(regexp_replace(query, E'[\n\r\t ]+', ' ', 'g'), 200)
+      'query',            '[omitted]'
   )) FROM external_suspect), '[]'::jsonb),
   'internal_excluded_count',   (SELECT n           FROM internal_excluded),
   'internal_excluded_max_age', (SELECT max_age_sec FROM internal_excluded),
@@ -121,9 +122,8 @@ SELECT jsonb_build_object(
       'blocking_gpid',   blocking_gpid,
       'waiting_nodeid',  waiting_nodeid,
       'blocking_nodeid', blocking_nodeid,
-      'waiting_stmt',    left(regexp_replace(blocked_statement, E'[\n\r\t ]+',' ','g'),120),
-      'blocking_stmt',   left(regexp_replace(current_statement_in_blocking_process,
-                                             E'[\n\r\t ]+',' ','g'),120)
+      'waiting_stmt',    '[omitted]',
+      'blocking_stmt',   '[omitted]'
   )) FROM pg_catalog.citus_lock_waits), '[]'::jsonb)
 )::text;
 $CMD$,
@@ -140,7 +140,7 @@ $CMD$,
 -- + internal-excluded summary). Sessions un-nest into _q1; lock waits fan
 -- out across all metadata nodes into _q1_lw; internal-exclusion summary
 -- rolls up in _q1_intsum.
-DROP TABLE IF EXISTS _q1;
+DROP TABLE IF EXISTS pg_temp._q1;
 CREATE TEMP TABLE _q1 AS
 SELECT
     CASE WHEN n.groupid = 0 THEN 'coordinator'
@@ -172,7 +172,7 @@ LEFT JOIN LATERAL jsonb_array_elements(
 WHERE n.isactive;
 
 -- Cross-node lock-wait rows, aggregated from every metadata node.
-DROP TABLE IF EXISTS _q1_lw;
+DROP TABLE IF EXISTS pg_temp._q1_lw;
 CREATE TEMP TABLE _q1_lw AS
 SELECT
     n.nodename || ':' || n.nodeport                      AS seen_on,
@@ -192,7 +192,7 @@ WHERE n.isactive AND n.hasmetadata
   AND lw IS NOT NULL;
 
 -- Per-node internal-session exclusion summary (for disclosure in headline).
-DROP TABLE IF EXISTS _q1_intsum;
+DROP TABLE IF EXISTS pg_temp._q1_intsum;
 CREATE TEMP TABLE _q1_intsum AS
 SELECT n.nodename || ':' || n.nodeport                   AS node,
        COALESCE((r.result::jsonb ->> 'internal_excluded_count')::int, 0)
@@ -271,7 +271,7 @@ LIMIT :top_n;
 -- ---------------------------------------------------------------------
 \echo
 \echo '-- Q1d. Ungranted locks on coordinator (coord-local scope) --'
-DROP TABLE IF EXISTS _q1d;
+DROP TABLE IF EXISTS pg_temp._q1d;
 CREATE TEMP TABLE _q1d AS
 SELECT
     l.locktype,
@@ -280,7 +280,7 @@ SELECT
     count(*) FILTER (WHERE NOT l.granted)::int                   AS waiters,
     count(*) FILTER (WHERE l.granted)::int                       AS holders,
     EXTRACT(EPOCH FROM now() -
-        min(a.xact_start) FILTER (WHERE NOT l.granted))::bigint  AS longest_wait_s
+        min(l.waitstart) FILTER (WHERE NOT l.granted))::bigint  AS longest_wait_s
 FROM pg_locks l
 LEFT JOIN pg_class  c ON c.oid = l.relation
 LEFT JOIN pg_stat_activity a ON a.pid = l.pid
@@ -322,10 +322,8 @@ WITH sev AS (
   FROM _q1
 )
 SELECT CASE
-  WHEN unreachable > 0 THEN
-    format('WARN : %s node(s) unreachable during Q1 snapshot.', unreachable)
   WHEN s = 3 THEN
-    format('CRITICAL : %s long active + %s idle-in-tx session(s); %s cross-node lock wait(s); %s coord lock waiter(s). Kill or commit now.',
+    format('WARN : %s long active + %s idle-in-tx session(s); %s cross-node lock wait(s); %s coord lock waiter(s). Review workload intent and blockers before cancellation.',
            long_active, idle_in_tx, lock_wait_rows, coord_lock_waiters)
   WHEN coord_lock_max_s >= :crit_query_sec::bigint THEN
     format('CRITICAL : coord lock wait %s sec (> %s); %s waiter(s) blocked.',
@@ -338,6 +336,8 @@ SELECT CASE
            coord_lock_max_s, :warn_query_sec, coord_lock_waiters)
   WHEN lock_wait_rows > 0 THEN
     format('WARN : %s cross-node lock wait(s) but no single session over WARN threshold.', lock_wait_rows)
+  WHEN unreachable > 0 THEN
+    format('INCOMPLETE : %s node(s) unreachable during Q1 snapshot.', unreachable)
   WHEN internal_excluded > 0 AND internal_excluded_max_age >= :warn_query_sec::bigint THEN
     format('INFO : %s citus_internal session(s) excluded; oldest %s sec. Rerun with -v include_internal=1 to see worker fragments of distributed queries.',
            internal_excluded, internal_excluded_max_age)
@@ -346,8 +346,9 @@ END
 FROM sev;
 \pset tuples_only off
 
-DROP TABLE _q1d;
-DROP TABLE _q1_intsum;
-DROP TABLE _q1_lw;
-DROP TABLE _q1;
-DROP TABLE _q1_raw;
+DROP TABLE pg_temp._q1d;
+DROP TABLE pg_temp._q1_intsum;
+DROP TABLE pg_temp._q1_lw;
+DROP TABLE pg_temp._q1;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._q1_raw;

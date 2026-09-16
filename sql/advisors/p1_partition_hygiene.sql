@@ -1,3 +1,5 @@
+\set advisor_id P1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / P1 : partition hygiene & maintenance runway
 -- ---------------------------------------------------------------------
@@ -72,7 +74,7 @@
 -- ---------------------------------------------------------------------
 -- Availability checks. time_partitions was added in Citus 10.0.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _p1_env;
+DROP TABLE IF EXISTS pg_temp._p1_env;
 CREATE TEMP TABLE _p1_env AS
 SELECT
     EXISTS (SELECT 1 FROM pg_class c
@@ -97,7 +99,7 @@ SELECT
 -- partition can tolerate range gaps without write failures, so we flag
 -- it and adjust the headline accordingly.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _p1_tp;
+DROP TABLE IF EXISTS pg_temp._p1_tp;
 CREATE TEMP TABLE _p1_tp (
     parent_table       text,
     parent_regclass    regclass,
@@ -149,15 +151,16 @@ BEGIN
                     WHERE s.logicalrelid = tp.parent_table), 0),
         tp.partition::text,
         tp.partition,
-        (tp.from_value IS NULL AND tp.to_value IS NULL),
+        pg_get_expr(child.relpartbound, child.oid) = 'DEFAULT',
         tp.from_value,
         tp.to_value,
         -- Type-aware cast. Only attempt when partition key is a date/time type.
         CASE WHEN t.typcategory = 'D' AND tp.from_value IS NOT NULL
-             THEN tp.from_value::timestamptz END,
+             THEN CASE WHEN tp.from_value = 'MINVALUE' THEN '-infinity'::timestamptz ELSE tp.from_value::timestamptz END END,
         CASE WHEN t.typcategory = 'D' AND tp.to_value   IS NOT NULL
-             THEN tp.to_value::timestamptz   END
+             THEN CASE WHEN tp.to_value = 'MAXVALUE' THEN 'infinity'::timestamptz ELSE tp.to_value::timestamptz END END
     FROM time_partitions tp
+    JOIN pg_class child ON child.oid = tp.partition
     LEFT JOIN pg_attribute a
       ON  a.attrelid = tp.parent_table
       AND a.attname  = tp.partition_column
@@ -169,7 +172,7 @@ END $$;
 -- ---------------------------------------------------------------------
 -- P1a : per-parent summary (time-partitioned families only)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _p1_summary;
+DROP TABLE IF EXISTS pg_temp._p1_summary;
 CREATE TEMP TABLE _p1_summary AS
 SELECT
     parent_table,
@@ -179,7 +182,11 @@ SELECT
     count(*) FILTER (WHERE NOT is_default)              AS partitions,
     count(*) FILTER (WHERE NOT is_default)
       * GREATEST(shard_count,1)                         AS total_shards,
-    bool_or(is_default)                                 AS has_default,
+    bool_or(is_default) OR EXISTS (
+      SELECT 1 FROM pg_inherits inheritance JOIN pg_class child ON child.oid=inheritance.inhrelid
+      WHERE inheritance.inhparent=to_regclass(parent_table)
+        AND pg_get_expr(child.relpartbound, child.oid)='DEFAULT'
+    ) AS has_default,
     min(from_ts) FILTER (WHERE NOT is_default)          AS earliest_from,
     max(to_ts)   FILTER (WHERE NOT is_default)          AS latest_to,
     -- Does SOME non-default partition cover "now"? If no, writes that
@@ -188,7 +195,7 @@ SELECT
             AND from_ts IS NOT NULL AND to_ts IS NOT NULL
             AND from_ts <= now() AND now() < to_ts)     AS covers_now,
     -- Future runway: days between latest partition's upper bound and now.
-    CASE WHEN max(to_ts) FILTER (WHERE NOT is_default) IS NOT NULL
+    CASE WHEN isfinite(max(to_ts) FILTER (WHERE NOT is_default))
          THEN EXTRACT(EPOCH FROM (
                max(to_ts) FILTER (WHERE NOT is_default) - now())) / 86400.0
          END::numeric(12,2)                             AS future_runway_days,
@@ -199,6 +206,11 @@ SELECT
 FROM _p1_tp
 WHERE is_time
 GROUP BY parent_table, parent_citus_kind, partition_col_type, shard_count;
+
+SELECT parent.oid::regclass AS parent_table,
+       'WARN : partitioned table has no partitions; confirm whether it should accept writes' AS finding
+FROM pg_class parent JOIN pg_partitioned_table partitioned ON partitioned.partrelid=parent.oid
+WHERE NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent=parent.oid);
 
 \echo
 \echo '-- P1a. Time-partitioned tables: runway summary --'
@@ -227,7 +239,7 @@ LIMIT :top_n;
 --                                 backfills; no current write impact)
 --         kind='overlap'       : prev_to > next from  (catalog anomaly)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _p1_gaps;
+DROP TABLE IF EXISTS pg_temp._p1_gaps;
 CREATE TEMP TABLE _p1_gaps AS
 WITH ordered AS (
   SELECT
@@ -320,7 +332,7 @@ LIMIT :top_n;
 -- ---------------------------------------------------------------------
 -- P1e : pg_partman config vs reality (only when installed)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _p1_partman;
+DROP TABLE IF EXISTS pg_temp._p1_partman;
 CREATE TEMP TABLE _p1_partman (
     parent_table         text,
     partition_interval   text,
@@ -384,14 +396,14 @@ WITH sig AS (
   SELECT
     (SELECT count(*) FROM _p1_summary
        WHERE covers_now = FALSE AND has_default = FALSE)       AS uncovered_now_n,
-    (SELECT count(*) FROM _p1_gaps WHERE kind='gap-future')    AS future_gap_n,
-    (SELECT count(*) FROM _p1_gaps WHERE kind='gap-historical')AS hist_gap_n,
+    (SELECT count(*) FROM _p1_gaps JOIN _p1_summary USING (parent_table) WHERE _p1_gaps.kind='gap-future' AND NOT has_default) AS future_gap_n,
+    (SELECT count(*) FROM _p1_gaps JOIN _p1_summary USING (parent_table) WHERE _p1_gaps.kind='gap-historical' AND NOT has_default) AS hist_gap_n,
     (SELECT count(*) FROM _p1_gaps WHERE kind='overlap')       AS overlap_n,
     (SELECT count(*) FROM _p1_summary
-       WHERE future_runway_days IS NOT NULL
+      WHERE NOT has_default AND future_runway_days IS NOT NULL
          AND future_runway_days < :crit_future_days)           AS crit_runway_n,
     (SELECT count(*) FROM _p1_summary
-       WHERE future_runway_days IS NOT NULL
+      WHERE NOT has_default AND future_runway_days IS NOT NULL
          AND future_runway_days < :min_future_days
          AND future_runway_days >= :crit_future_days)          AS warn_runway_n,
     (SELECT count(*) FROM _p1_summary
@@ -406,24 +418,24 @@ SELECT CASE
   WHEN NOT has_view THEN
     'INFO : Citus time_partitions view not available (Citus < 10.0). P1 analysis skipped.'
   WHEN total_n = 0 THEN
-    'OK : no time-partitioned tables found.'
+    'INFO : no temporal ranges available in time_partitions; review partition inventory and empty parents.'
   WHEN uncovered_now_n > 0 THEN
-    format('CRITICAL : %s time-partitioned table(s) have NO partition covering now() AND no DEFAULT partition. New INSERTs WILL fail. See P1a.',
+    format('INFO : %s time-partitioned table(s) do not cover now() and have no DEFAULT. Relevant only if new writes target current timestamps; archive-only tables may be intentional. See P1a.',
            uncovered_now_n)
   WHEN future_gap_n > 0 THEN
-    format('CRITICAL : %s future partition gap(s). INSERTs landing in the gap WILL fail. See P1b.',
+    format('INFO : %s future gaps without DEFAULT coverage. Confirm whether incoming data targets these ranges. See P1b.',
            future_gap_n)
   WHEN crit_runway_n > 0 THEN
-    format('CRITICAL : %s table(s) have less than %s days of future partitions. Run create_time_partitions() NOW. See P1a.',
+    format('INFO : %s table(s) have less than %s days of bounded future coverage without DEFAULT. Review expected ingestion before extending partitions. See P1a.',
            crit_runway_n, :crit_future_days::text)
   WHEN overlap_n > 0 THEN
     format('CRITICAL : %s partition range overlap(s) detected. Catalog anomaly; investigate before DDL changes.',
            overlap_n)
   WHEN warn_runway_n > 0 THEN
-    format('WARN : %s table(s) have less than %s days of future partitions. Schedule create_time_partitions(). See P1a.',
+    format('INFO : %s table(s) have less than %s days of bounded future coverage without DEFAULT. Review ingestion policy. See P1a.',
            warn_runway_n, :min_future_days::text)
   WHEN hist_gap_n > 0 THEN
-    format('WARN : %s historical partition gap(s). No current write impact but backfills into the gap will fail. See P1b.',
+    format('INFO : %s historical gaps without DEFAULT coverage. Relevant to backfills into those ranges. See P1b.',
            hist_gap_n)
   WHEN wide_n > 0 THEN
     format('WARN : %s partitioned table(s) exceed partition/shard limits (> %s partitions or > %s total shards). Planning-time and metadata cost may be heavy.',
@@ -437,8 +449,8 @@ END
 FROM sig;
 \pset tuples_only off
 
-DROP TABLE IF EXISTS _p1_partman;
-DROP TABLE IF EXISTS _p1_gaps;
-DROP TABLE IF EXISTS _p1_summary;
-DROP TABLE IF EXISTS _p1_tp;
-DROP TABLE IF EXISTS _p1_env;
+DROP TABLE IF EXISTS pg_temp._p1_partman;
+DROP TABLE IF EXISTS pg_temp._p1_gaps;
+DROP TABLE IF EXISTS pg_temp._p1_summary;
+DROP TABLE IF EXISTS pg_temp._p1_tp;
+DROP TABLE IF EXISTS pg_temp._p1_env;

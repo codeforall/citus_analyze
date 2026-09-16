@@ -22,6 +22,11 @@ import argparse, csv, html, io, re, sys, urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from advisor_result import read_result, worst_verdict
+from recommendations import GUIDANCE, plain_summary, recommendation
+from memory_capacity import PREFIX, capacity_summary, render_capacity
+
 
 # --- advisor metadata & recommendation extractors --------------------------
 
@@ -31,427 +36,132 @@ def _strip_pipe_table(text: str) -> str:
 
 
 def _rec_m1(text: str) -> str:
-    m = re.search(r'RECOMMENDED NODE RAM\s*:\s*([\d.]+\s*MB)\s*~\s*([\d.]+\s*[KMG]B)', text)
-    if m:
-        return f'≥ {m.group(2).strip()} per node ({m.group(1).strip()})'
-    return ''
+    return recommendation('M1', text)
 
 
 def _rec_gr1(text: str) -> str:
-    m = re.search(r'max_locks_per_transaction\s*>=\s*(\d+)\s*\(current\s+(\d+)', text)
-    if m:
-        lpt, cur = m.group(1), m.group(2)
-        if cur == lpt:
-            return f'max_locks_per_transaction ≥ {lpt} (current — OK)'
-        return f'max_locks_per_transaction ≥ {lpt} (current {cur})'
-    m = re.search(r'max_locks_per_transaction\s*>=\s*(\d+)', text)
-    if m:
-        return f'max_locks_per_transaction ≥ {m.group(1)}'
-    return ''
+    return recommendation('GR1', text)
 
 
 def _rec_c3(text: str) -> str:
-    m = re.search(r'MAX SAFE EXTERNAL CONCURRENCY\s*:\s*(\d+)', text)
-    if m:
-        return f'≤ {m.group(1)} concurrent external sessions'
-    m2 = re.search(r'safe up to (\d+) concurrent', text)
-    if m2:
-        return f'≤ {m2.group(1)} concurrent external sessions'
-    return ''
+    return recommendation('C3', text)
 
 
 def _rec_s3(text: str) -> str:
-    # Extract the worst max/avg for any colocation group, surface target
-    stripped = _strip_pipe_table(text)
-    vals = []
-    for m in re.finditer(r'\bmax/avg\s*=\s*([\d.]+)', text):
-        try:
-            vals.append(float(m.group(1)))
-        except ValueError:
-            pass
-    if vals:
-        return f'shard max/avg ≤ 2.0 per colocation group (current worst {max(vals):.2f})'
-    return 'shard max/avg ≤ 2.0 per colocation group'
+    return recommendation('S3', text)
 
 
 def _rec_r1(text: str) -> str:
-    if re.search(r'\bCRITICAL\b|\bWARN\b', text):
-        return '0 failing jobs, 0 stuck rebalance steps'
-    return '0 failing jobs (currently clean)'
+    return recommendation('R1', text)
 
 
 def _rec_n6(text: str) -> str:
-    m = re.search(r'Raise candidate max_locks_per_transaction to (\d+)', text)
-    if m:
-        return f'candidate max_locks_per_transaction ≥ {m.group(1)} before citus_add_node'
-    m2 = re.search(r'suggested lpt=(\d+).*?planned\s+(\d+)', text)
-    if m2:
-        need, planned = m2.group(1), m2.group(2)
-        if need == planned:
-            return f'candidate max_locks_per_transaction ≥ {need} (current — OK)'
-        return f'candidate max_locks_per_transaction ≥ {need} (planned {planned})'
-    if 'nontransactional' in text and 'prefer' in text.lower():
-        return 'citus.metadata_sync_mode = nontransactional before adding the node'
-    return 'current transactional sync is safe'
+    return recommendation('N6', text)
 
 
 def _rec_a3(text: str) -> str:
-    m = re.search(r'(\d+)\s+orphan(?:ed)?\s+2PC', text)
-    if m and m.group(1) != '0':
-        return f'0 orphaned 2PC records (currently {m.group(1)})'
-    return '0 orphaned 2PC records'
+    return recommendation('A3', text)
 
 
 def _rec_sc1(text: str) -> str:
-    m_cur = re.search(r'current_total_shards[^\d]*(\d+)', text)
-    m_rec = re.search(r'recommended_total_shards[^\d]*\d+\s*\|\s*(\d+)', text)
-    if m_cur and m_rec:
-        return f'{m_rec.group(1)} shards (currently {m_cur.group(1)})'
-    return '1-2x worker count per colocation group'
+    return recommendation('SC1', text)
 
 
 def _rec_p2(text: str) -> str:
-    m = re.search(r'stale_zero_count[^\d]*(\d+)', text)
-    if m and m.group(1) != '0':
-        return f'0 stale placements (currently {m.group(1)})'
-    return '0 stale placements'
+    return recommendation('P2', text)
 
 
 def _rec_mx1(text: str) -> str:
-    # Report worst (smallest) client_slots across MX nodes.
-    slots = [int(m.group(1)) for m in re.finditer(r'\|\s*(\d+)\s*\|\s*\n?\s*\+', text)]
-    crit = re.search(r'critical_nodes[^\d]*\d+\s*\|\s*(\d+)', text)
-    if crit and crit.group(1) != '0':
-        return f'0 MX nodes with <10 client slots (currently {crit.group(1)})'
-    return '>=20 client slots free on every MX node'
+    return recommendation('MX1', text)
 
 
 def _rec_d1(text: str) -> str:
-    # Extract the minimum runway observed across nodes.
-    runways = [int(m.group(1))
-               for m in re.finditer(r'runway at current rate\s*:\s*(\d+)\s*days', text)]
-    free_pcts = [float(m.group(1))
-                 for m in re.finditer(r'(-?[\d.]+)%\s*of disk', text)]
-    parts = []
-    if runways:
-        parts.append(f'runway ≥ 90 days (current worst {min(runways)})')
-    if free_pcts:
-        parts.append(f'≥ 20% free (current worst {min(free_pcts):.1f}%)')
-    if parts:
-        return '; '.join(parts)
-    return '≥ 20% free and ≥ 90 days runway per node'
+    return recommendation('D1', text)
 
 
 def _rec_q1(text: str) -> str:
-    # Summarise current session pressure from the headline-ish lines.
-    # Look for "N long active + M idle-in-tx session(s); K cross-node lock wait(s)"
-    m = re.search(r'(\d+)\s+long active\s*\+\s*(\d+)\s+idle-in-tx.*?(\d+)\s+cross-node lock wait',
-                  text)
-    if m:
-        la, iit, lw = m.group(1), m.group(2), m.group(3)
-        return (f'0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits '
-                f'(currently {la} / {iit} / {lw})')
-    if re.search(r'no long-running queries or idle-in-tx sessions', text):
-        return '0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits'
-    return '0 queries > 5 min; 0 idle-in-tx > 5 min; 0 cross-node lock waits'
+    return recommendation('Q1', text)
 
 
 def _rec_guc1(text: str) -> str:
-    # Look for CRITICAL / WARN counts in the headline.
-    m = re.search(r'(\d+)\s+rule violation\(s\);\s*(\d+)\s+drift\(s\);\s*(\d+)\s+warning',
-                  text)
-    if m:
-        return (f'0 rule violations; 0 drift; 0 warnings '
-                f'(currently {m.group(1)} / {m.group(2)} / {m.group(3)})')
-    m = re.search(r'(\d+)\s+rule warning\(s\);\s*(\d+)\s+cross-node drift', text)
-    if m:
-        return (f'0 rule violations; 0 drift; 0 warnings '
-                f'(currently 0 / {m.group(2)} / {m.group(1)})')
-    if re.search(r'no drift and no rule violations', text):
-        return '0 rule violations; 0 drift; 0 warnings'
-    return '0 rule violations; 0 drift; 0 warnings'
+    return recommendation('GUC1', text)
 
 
 def _rec_v1(text: str) -> str:
-    if re.search(r'matching PG major and Citus versions, no pending upgrades', text):
-        return 'all nodes matching PG major + Citus version; no pending upgrades'
-    if re.search(r'Citus BINARY package version differs', text):
-        return 'homogeneous Citus binary package version (currently DRIFTED)'
-    if re.search(r'Citus extension SQL version differs', text):
-        return 'homogeneous Citus extension version (currently DRIFTED)'
-    if re.search(r"missing 'citus' from shared_preload_libraries", text):
-        return "'citus' in shared_preload_libraries on every node"
-    if re.search(r'PostgreSQL MAJOR version differs', text):
-        return 'same PostgreSQL major on every node'
-    if re.search(r'pending ALTER EXTENSION citus UPDATE', text):
-        return '0 nodes with pending ALTER EXTENSION citus UPDATE'
-    if re.search(r'missing on at least one worker', text):
-        return 'coord extensions fully present on every worker'
-    if re.search(r'could upgrade Citus to a newer available version', text):
-        return 'installed Citus = latest available (informational)'
-    return 'all nodes matching PG major + Citus version; no pending upgrades'
+    return recommendation('V1', text)
 
 
 def _rec_p1(text: str) -> str:
-    if re.search(r'no partition covering now\(\)', text):
-        return 'every time-partitioned table covers now() or has a DEFAULT partition'
-    if re.search(r'future partition gap', text):
-        return '0 future partition gaps (no imminent write failure)'
-    if re.search(r'partition range overlap', text):
-        return 'no overlapping partition ranges (catalog clean)'
-    if re.search(r'less than \S+ days of future partitions', text):
-        return 'sufficient future partition runway for every time-partitioned table'
-    if re.search(r'historical partition gap', text):
-        return 'no historical partition gaps'
-    if re.search(r'exceed partition/shard limits', text):
-        return 'no partitioned table exceeds the partition/shard width limits'
-    if re.search(r'further than \S+ days in the future', text):
-        return 'no over-premade future partitions'
-    if re.search(r'time_partitions view not available', text):
-        return 'Citus time_partitions view available (requires Citus >= 10.0)'
-    return 'adequate partition runway, no gaps, no width hotspots'
+    return recommendation('P1', text)
 
 
 def _rec_i1(text: str) -> str:
-    if re.search(r'INVALID or NOT-READY index', text):
-        return '0 invalid/not-ready indexes (REINDEX/DROP recommended on hits)'
-    if re.search(r'pg_stat counters reset only', text):
-        return 'pg_stat history old enough to trust unused-index verdict'
-    if re.search(r'with 0 scans across all shards', text):
-        return '0 unused distributed-table indexes (every index is read at least once)'
-    if re.search(r'duplicate index pair', text):
-        return '0 duplicate indexes'
-    if re.search(r'unreachable; index health', text):
-        return 'all nodes reachable for index health check'
-    return 'no invalid indexes, no unused distributed indexes, no duplicates'
+    return recommendation('I1', text)
 
 
 def _rec_b1(text: str) -> str:
-    m = re.search(r'(\d+)\s+relation\(s\)\s*>=\s*(\d+)%\s+dead tuples', text)
-    if m:
-        return f'< {m.group(2)}% dead tuples per relation (currently {m.group(1)} over)'
-    if re.search(r'past their autovacuum trigger', text):
-        return 'no relations past their autovacuum trigger'
-    if re.search(r'autovacuum_max_workers fully busy', text):
-        return 'autovacuum_max_workers headroom on every node'
-    if re.search(r'stale ANALYZE', text):
-        return 'fresh ANALYZE on every distributed shard'
-    if re.search(r'bloat estimate is unreliable', text):
-        return 'pg_stat history old enough to trust bloat estimate'
-    if re.search(r'unreachable; bloat', text):
-        return 'all nodes reachable for bloat check'
-    return 'bloat under control, autovacuum keeping up, ANALYZE fresh'
+    return recommendation('B1', text)
 
 
 def _rec_cp1(text: str) -> str:
-    m = re.search(r'pool_size\s+range\s+(\d+)\.\.(\d+)', text)
-    if m:
-        return f'pgbouncer pool_size {m.group(1)}–{m.group(2)} per entry node (transaction mode)'
-    if re.search(r'ALREADY over the safe external cap', text):
-        return 'reduce client traffic or scale pool DOWN before adopting recs'
-    if re.search(r'80% of safe cap', text):
-        return 'adopt CP1a recommendations before next traffic peak'
-    if re.search(r'per-db pool sums above the safe cap', text):
-        return 'partition the per-db pool budget; sum must respect safe cap'
-    if re.search(r'PG <14.*prepared statements is unsupported', text):
-        return 'disable prepared statements in app, or upgrade PG to 14+'
-    return 'pool_size sized within safe cap; transaction mode in pgbouncer'
-
+    return recommendation('CP1', text)
 
 
 def _rec_w1(text: str) -> str:
-    if re.search(r'fsync or full_page_writes is OFF', text):
-        return 'set fsync=on and full_page_writes=on immediately'
-    if re.search(r'archive_mode is on but archiving is broken', text):
-        return 'fix archive_command / archive_library destination'
-    m = re.search(r'(\d+) node\(s\) have >= \d+% requested checkpoints', text)
-    if m:
-        return f'raise max_wal_size on {m.group(1)} node(s) to shift checkpoints to timed'
-    m = re.search(r'(\d+) node\(s\) have wal_buffers < (\d+) MB', text)
-    if m:
-        return f'raise wal_buffers to >= {m.group(2)} MB on {m.group(1)} node(s)'
-    if re.search(r'archiver has a recent failure', text):
-        return 'investigate archiver destination (W1d)'
-    return 'WAL path healthy'
+    return recommendation('W1', text)
 
 
 def _rec_stat1(text: str) -> str:
-    m = re.search(r'(\d+) distributed table\(s\) have NO analyzed shards', text)
-    if m:
-        return f'run ANALYZE on {m.group(1)} distributed table(s)'
-    m = re.search(r'(\d+) distributed table\(s\) have shard analyze older than (\d+) days', text)
-    if m:
-        return f're-ANALYZE {m.group(1)} table(s) older than {m.group(2)}d'
-    m = re.search(r'(\d+) distributed table\(s\) have some un-analyzed shards', text)
-    if m:
-        return f'ANALYZE {m.group(1)} table(s): plans differ across workers'
-    m = re.search(r'(\d+) distributed table\(s\) have shards older than (\d+) days', text)
-    if m:
-        return f'schedule ANALYZE for {m.group(1)} table(s) stale >{m.group(2)}d'
-    m = re.search(r'(\d+) distributed table\(s\) have >= (\d+)% churn', text)
-    if m:
-        return f'{m.group(1)} table(s) with >={m.group(2)}% churn: ANALYZE'
-    if re.search(r'default_statistics_target too low', text):
-        return 'raise default_statistics_target on flagged node(s)'
-    return 'statistics fresh'
+    return recommendation('STAT1', text)
 
 
 def _rec_sec1(text: str) -> str:
-    m = re.search(r'(\d+) role\(s\) missing on some cluster nodes', text)
-    if m:
-        return f'pre-create {m.group(1)} role(s) on missing nodes or enable role propagation'
-    m = re.search(r'(\d+) extension\(s\) at different versions', text)
-    if m:
-        return f'ALTER EXTENSION UPDATE for {m.group(1)} extension(s)'
-    m = re.search(r'(\d+) superuser role\(s\) \(> (\d+) allowed\)', text)
-    if m:
-        return f'reduce superusers from {m.group(1)} (> {m.group(2)} allowed)'
-    if re.search(r'password_encryption is not scram-sha-256', text):
-        return 'set password_encryption=scram-sha-256 cluster-wide'
-    if re.search(r'login role\(s\) with md5 / missing password', text):
-        return 'reset passwords to scram-sha-256, set passwords on all login roles'
-    if re.search(r'pg_hba rules use trust or plain password', text):
-        return 'replace trust/password rules with scram-sha-256 in pg_hba'
-    if re.search(r'inter-node traffic may be unencrypted', text):
-        return 'enable ssl and set sslmode=require in citus.node_conninfo'
-    return 'auth posture healthy'
+    return recommendation('SEC1', text)
 
 
 def _rec_ref1(text: str) -> str:
-    if re.search(r'no reference tables defined', text):
-        return 'no reference tables'
-    if re.search(r'missing placements', text):
-        return 'run SELECT replicate_reference_tables() to restore placements'
-    m = re.search(r'(\d+) reference table\(s\) exceed (\d+) MB per copy', text)
-    if m:
-        return f'{m.group(1)} ref(s) over {m.group(2)} MB/copy: consider distributing instead'
-    if re.search(r'are oversized', text):
-        return 'oversized reference tables waste worker RAM per copy'
-    if re.search(r'size drift across workers', text):
-        return 'investigate replication: copies diverge across workers'
-    if re.search(r'extra placements', text):
-        return 'run citus_cleanup_orphaned_resources() to remove extra placements'
-    return 'reference tables healthy'
+    return recommendation('REF1', text)
 
 
 def _rec_net1(text: str) -> str:
-    m = re.search(r'(\d+) connectivity edge\(s\) failed', text)
-    if m:
-        return f'fix {m.group(1)} broken edge(s) in cluster mesh (pg_hba/firewall/citus.node_conninfo)'
-    if re.search(r'at least one node unreachable', text):
-        return 'one or more nodes dropped during sampling -- investigate'
-    m = re.search(r'at least one node has avg RTT > (\d+) ms', text)
-    if m:
-        return f'investigate network path (RTT > {m.group(1)} ms)'
-    return 'mesh healthy'
+    return recommendation('NET1', text)
 
 
 def _rec_rep1(text: str) -> str:
-    m = re.search(r'replay_lag exceeds (\d+) s', text)
-    if m:
-        return f'investigate standby: replay_lag >= {m.group(1)}s'
-    m = re.search(r'inactive replication slot\(s\) retain >= (\d+) MB', text)
-    if m:
-        return f'drop inactive slots or revive subscribers ({m.group(1)} MB retained)'
-    if re.search(r'synchronous_standby_names set without matching', text):
-        return 'verify sync standby is connected or clear synchronous_standby_names'
-    if re.search(r'orphaned Citus rebalancer replication slot', text):
-        return 'investigate pg_dist_cleanup and drop orphan slots'
-    if re.search(r'no replication senders or slots configured', text):
-        return 'no HA configured (informational)'
-    return 'replication healthy'
+    return recommendation('REP1', text)
 
 
 def _rec_r2(text: str) -> str:
-    if re.search(r'cluster is balanced', text):
-        return 'no rebalance needed under default strategy'
-    m = re.search(r'(\d+)\s+moves,\s+([^;]+);.*est wall time\s+(\d+)\s*s', text)
-    if m:
-        return f'plan: {m.group(1)} moves, {m.group(2).strip()}, ~{m.group(3)}s'
-    if re.search(r'target\(s\) would >2x', text):
-        return 'verify free disk on target nodes before citus_rebalance_start()'
-    if re.search(r'by_shard_count but shards vary', text):
-        return 'switch default rebalance_strategy to by_disk_size'
-    return 'review R2a-R2f before invoking citus_rebalance_start()'
+    return recommendation('R2', text)
 
 
 # (id, title, short blurb, extractor)
 ADVISORS = [
-    ("M1",  "Node memory minimum (OOM-safety)",
-     "Bottom-up per-node RAM model (shared_buffers + backends + AV + WAL + MX pool + OS).",
-     _rec_m1),
-    ("D1",  "Disk capacity & shard-growth runway",
-     "Per-node used/free space, historical growth rate, and days-until-full projection.",
-     _rec_d1),
-    ("Q1",  "Long-running queries & lock waits",
-     "Snapshots long active queries, idle-in-tx, citus_lock_waits, and ungranted locks.",
-     _rec_q1),
-    ("GUC1", "Citus + PostgreSQL configuration audit",
-     "Cross-node GUC drift + rule-based checks on 30+ availability-sensitive settings.",
-     _rec_guc1),
-    ("V1",  "Version & upgrade readiness",
-     "Per-node PG/Citus version match, pending ALTER EXTENSION UPDATE, extension drift.",
-     _rec_v1),
-    ("P1",  "Partition hygiene & maintenance runway",
-     "Future-partition runway, gap detection, partition/shard width limits, pg_partman reality check.",
-     _rec_p1),
-    ("I1",  "Index health (per-shard aware)",
-     "Invalid indexes, unused distributed-table indexes (0 scans across all shards), duplicates, missing FK indexes.",
-     _rec_i1),
-    ("B1",  "Table bloat & autovacuum lag",
-     "Per-shard estimated dead-tuple ratio, past-due autovacuum triggers, suggested per-table scale_factor, AV worker saturation, stale ANALYZE.",
-     _rec_b1),
-    ("CP1", "pgbouncer pool sizing",
-     "Per-entry-node pool_size, max_client_conn, reserve/min pool, multi-db budget, copy-paste pgbouncer.ini.",
-     _rec_cp1),
-    ("R2",  "Rebalance plan preview",
-     "Dry-run of get_rebalance_table_shards_plan(); bytes moved, per-worker impact, disk amplification, strategy sanity, wall-time estimate.",
-     _rec_r2),
-    ("REF1", "Reference-table health",
-     "Per-reference-table inventory, oversize warnings, placement count mismatches, size drift across workers.",
-     _rec_ref1),
-    ("W1",   "WAL & checkpoint pressure",
-     "Per-node wal_buffers, max_wal_size, checkpoint trigger mix (timed vs requested), archiver health, replication slots, durability GUCs (fsync, full_page_writes).",
-     _rec_w1),
-    ("STAT1","Statistics freshness",
-     "Per-shard last_analyze/last_autoanalyze drift, tables with significant churn since ANALYZE, never-analyzed tables, extended-stats suggestions, default_statistics_target sanity.",
-     _rec_stat1),
-    ("SEC1", "Security & role audit",
-     "Superuser inventory, password hash methods (scram vs md5 vs none), role drift across nodes (MX blocker), per-node security GUCs, PUBLIC grants on distributed tables, extension version drift, weak pg_hba rules.",
-     _rec_sec1),
-    ("NET1", "Node reachability & latency",
-     "Full NxN connectivity matrix from citus_check_cluster_node_health(), asymmetric-edge detection (A->B ok, B->A fails), coord->node RTT sampling with per-node verdict vs cluster median.",
-     _rec_net1),
-    ("REP1", "Streaming replication & slot lag",
-     "Per-node pg_stat_replication senders (state / sync_state / replay_lag), replication slots with WAL retention bytes, orphan Citus rebalancer slots, recovery state, synchronous_commit vs synchronous_standby_names sanity.",
-     _rec_rep1),
-    ("GR1", "Shard / partition growth memory model",
-     "Per-backend cache growth + PG lock-hash capacity (lpt × (MaxBackends + mpx)).",
-     _rec_gr1),
-    ("C3",  "Max safe external connections (MX-aware)",
-     "Min-bottleneck of inbound limits, outbound pool fan-out, and internal quota.",
-     _rec_c3),
-    ("S3",  "Data skew across shards & workers",
-     "Per-colocation-group shard size skew + per-worker bytes balance.",
-     _rec_s3),
-    ("R1",  "Rebalance / background-job health",
-     "Citus background_job / background_task queue hygiene, stuck steps, cleanup backlog.",
-     _rec_r1),
-    ("N6",  "Metadata-sync feasibility for add-node",
-     "Predicts add-node success: payload, candidate lock-hash sizing, wall-time, memory.",
-     _rec_n6),
-    ("A3",  "2PC backlog & orphan prepared xacts",
-     "Finds prepared xacts on workers that pg_dist_transaction doesn't know about.",
-     _rec_a3),
-    ("SC1", "Shard-count right-sizing",
-     "Per-colocation shard-count recommendation based on size and worker count.",
-     _rec_sc1),
-    ("P2",  "Placement stats freshness",
-     "Detects pg_dist_placement.shardlength drift vs on-disk size (stale rebalancer cost model).",
-     _rec_p2),
-    ("MX1", "MX mesh connection budget",
-     "Per-node client-slot headroom after subtracting MX mesh fan-in + system reserve.",
-     _rec_mx1),
+    ("M1", GUIDANCE["M1"]["title"], GUIDANCE["M1"]["checks"], _rec_m1),
+    ("D1", GUIDANCE["D1"]["title"], GUIDANCE["D1"]["checks"], _rec_d1),
+    ("Q1", GUIDANCE["Q1"]["title"], GUIDANCE["Q1"]["checks"], _rec_q1),
+    ("GUC1", GUIDANCE["GUC1"]["title"], GUIDANCE["GUC1"]["checks"], _rec_guc1),
+    ("V1", GUIDANCE["V1"]["title"], GUIDANCE["V1"]["checks"], _rec_v1),
+    ("P1", GUIDANCE["P1"]["title"], GUIDANCE["P1"]["checks"], _rec_p1),
+    ("I1", GUIDANCE["I1"]["title"], GUIDANCE["I1"]["checks"], _rec_i1),
+    ("B1", GUIDANCE["B1"]["title"], GUIDANCE["B1"]["checks"], _rec_b1),
+    ("CP1", GUIDANCE["CP1"]["title"], GUIDANCE["CP1"]["checks"], _rec_cp1),
+    ("R2", GUIDANCE["R2"]["title"], GUIDANCE["R2"]["checks"], _rec_r2),
+    ("REF1", GUIDANCE["REF1"]["title"], GUIDANCE["REF1"]["checks"], _rec_ref1),
+    ("W1", GUIDANCE["W1"]["title"], GUIDANCE["W1"]["checks"], _rec_w1),
+    ("STAT1", GUIDANCE["STAT1"]["title"], GUIDANCE["STAT1"]["checks"], _rec_stat1),
+    ("SEC1", GUIDANCE["SEC1"]["title"], GUIDANCE["SEC1"]["checks"], _rec_sec1),
+    ("NET1", GUIDANCE["NET1"]["title"], GUIDANCE["NET1"]["checks"], _rec_net1),
+    ("REP1", GUIDANCE["REP1"]["title"], GUIDANCE["REP1"]["checks"], _rec_rep1),
+    ("GR1", GUIDANCE["GR1"]["title"], GUIDANCE["GR1"]["checks"], _rec_gr1),
+    ("C3", GUIDANCE["C3"]["title"], GUIDANCE["C3"]["checks"], _rec_c3),
+    ("S3", GUIDANCE["S3"]["title"], GUIDANCE["S3"]["checks"], _rec_s3),
+    ("R1", GUIDANCE["R1"]["title"], GUIDANCE["R1"]["checks"], _rec_r1),
+    ("N6", GUIDANCE["N6"]["title"], GUIDANCE["N6"]["checks"], _rec_n6),
+    ("A3", GUIDANCE["A3"]["title"], GUIDANCE["A3"]["checks"], _rec_a3),
+    ("SC1", GUIDANCE["SC1"]["title"], GUIDANCE["SC1"]["checks"], _rec_sc1),
+    ("P2", GUIDANCE["P2"]["title"], GUIDANCE["P2"]["checks"], _rec_p2),
+    ("MX1", GUIDANCE["MX1"]["title"], GUIDANCE["MX1"]["checks"], _rec_mx1),
 ]
 
 
@@ -499,177 +209,177 @@ SEV_ICON = {
 ADVISOR_META = {
     "M1": dict(
         cat="memory",
-        checks="The minimum RAM each node needs so PostgreSQL can run the current workload without hitting the kernel's OOM killer.",
-        matters="If the machine runs out of memory, the kernel kills PostgreSQL processes at random and the node goes down hard. Adding shards or partitions makes the peak-memory footprint grow; a cluster that fits today can OOM next week.",
-        fix="Compare the RAM reported against the advisor's recommended minimum. If below, resize the instance or lower work_mem / max_connections. See the advisor output for the exact shortfall and the formula.",
+        checks=GUIDANCE["M1"]["checks"],
+        matters=GUIDANCE["M1"]["matters"],
+        fix=GUIDANCE["M1"]["fix"],
         docs="https://www.postgresql.org/docs/current/runtime-config-resource.html",
     ),
     "D1": dict(
         cat="ops",
-        checks="Free disk on every node, the recent growth rate, and how many days until the disk fills.",
-        matters="Postgres stops accepting writes the moment a data directory fills up, and a disk-full node blocks the whole distributed cluster. Runway under a week is an outage waiting to happen.",
-        fix="For tight runways: expand the volume, drop stale partitions with DROP TABLE, or trigger citus_rebalance_start() to move shards to a less-full node.",
+        checks=GUIDANCE["D1"]["checks"],
+        matters=GUIDANCE["D1"]["matters"],
+        fix=GUIDANCE["D1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/admin_guide/cluster_management.html",
     ),
     "Q1": dict(
         cat="perf",
-        checks="Currently running queries that have been active a long time, idle-in-transaction sessions, and lock waits across the cluster.",
-        matters="One long query or a stuck transaction can hold locks that block shard moves, DDL, or every writer to a table. Idle-in-tx also holds xmin horizon open, causing bloat.",
-        fix="Identify the culprit via pg_stat_activity / citus_lock_waits in the advisor output, then SELECT pg_terminate_backend(<pid>) after confirming with the app owner.",
+        checks=GUIDANCE["Q1"]["checks"],
+        matters=GUIDANCE["Q1"]["matters"],
+        fix=GUIDANCE["Q1"]["fix"],
         docs="https://www.postgresql.org/docs/current/monitoring-stats.html",
     ),
     "GUC1": dict(
         cat="config",
-        checks="PostgreSQL and Citus configuration settings on each node, compared against each other and against safety rules.",
-        matters="Citus assumes every worker has the same settings for several criticals (max_worker_processes, shared_preload_libraries, timezone). Drift breaks parallel execution, 2PC, and MX routing. Unsafe values (fsync=off, trust auth) risk data loss or compromise.",
-        fix="For drift: align the setting on every node and reload. For rule violations: adopt the recommended value per the advisor's per-setting note.",
+        checks=GUIDANCE["GUC1"]["checks"],
+        matters=GUIDANCE["GUC1"]["matters"],
+        fix=GUIDANCE["GUC1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_guc.html",
     ),
     "V1": dict(
         cat="upgrade",
-        checks="Whether every node is on the same PostgreSQL and Citus version, and whether pending extension upgrades exist.",
-        matters="Mixed versions block metadata sync, break add_node, and can corrupt shard placements. A pending ALTER EXTENSION UPDATE means the cluster is half-upgraded.",
-        fix="Upgrade lagging nodes first, then run ALTER EXTENSION citus UPDATE on every database. Follow Citus's documented major-version upgrade path.",
+        checks=GUIDANCE["V1"]["checks"],
+        matters=GUIDANCE["V1"]["matters"],
+        fix=GUIDANCE["V1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/admin_guide/upgrading_citus.html",
     ),
     "P1": dict(
         cat="data",
-        checks="Time-partitioned tables: how many future partitions exist, missing month/day gaps, widely-varying partition sizes.",
-        matters="If future partitions run out, inserts fail with 'no partition of relation found'. A gap in the partition chain silently drops rows or causes routing errors.",
-        fix="Run SELECT create_time_partitions(...) to extend runway; reconcile gaps with explicit CREATE TABLE; consider pg_partman for auto-maintenance.",
+        checks=GUIDANCE["P1"]["checks"],
+        matters=GUIDANCE["P1"]["matters"],
+        fix=GUIDANCE["P1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/use_cases/timeseries.html",
     ),
     "I1": dict(
         cat="perf",
-        checks="Invalid indexes, unused indexes on distributed tables, and duplicate indexes.",
-        matters="Invalid indexes waste space and are silently ignored by the planner. Unused indexes still slow down every INSERT/UPDATE on the shard. Duplicates double the write cost for nothing.",
-        fix="DROP INDEX CONCURRENTLY the flagged invalids. For unused ones, confirm with the app team and DROP. For duplicates, keep the broader index and drop the narrower redundant one.",
+        checks=GUIDANCE["I1"]["checks"],
+        matters=GUIDANCE["I1"]["matters"],
+        fix=GUIDANCE["I1"]["fix"],
         docs="https://www.postgresql.org/docs/current/sql-dropindex.html",
     ),
     "B1": dict(
         cat="perf",
-        checks="Estimated table bloat, autovacuum lag, and tables whose ANALYZE is stale.",
-        matters="Bloated tables bloat their indexes, slow sequential scans, waste disk, and can even trigger xid wraparound emergencies. Stale stats cause bad plans across every shard.",
-        fix="For heavy bloat: VACUUM (FULL) during maintenance window, or pg_repack for online reclaim. For autovacuum lag: lower per-table autovacuum_vacuum_scale_factor or raise autovacuum_max_workers.",
+        checks=GUIDANCE["B1"]["checks"],
+        matters=GUIDANCE["B1"]["matters"],
+        fix=GUIDANCE["B1"]["fix"],
         docs="https://www.postgresql.org/docs/current/routine-vacuuming.html",
     ),
     "CP1": dict(
         cat="conn",
-        checks="The safe pgbouncer pool_size and max_client_conn for this cluster, given max_connections and Citus internal reservations.",
-        matters="If pgbouncer is over-sized, a connection spike cascades into PostgreSQL and hits max_connections limits on every worker. Under-sized, it throttles the app.",
-        fix="Copy the pgbouncer.ini snippet from the advisor output into your pgbouncer config and reload. Reverify after any change to max_connections or citus.max_adaptive_executor_pool_size.",
+        checks=GUIDANCE["CP1"]["checks"],
+        matters=GUIDANCE["CP1"]["matters"],
+        fix=GUIDANCE["CP1"]["fix"],
         docs="https://www.pgbouncer.org/config.html",
     ),
     "R2": dict(
         cat="ops",
-        checks="A preview of what a rebalance would do: bytes moved, per-worker impact, disk amplification, and estimated wall time.",
-        matters="An uninformed rebalance can saturate the network, double a worker's disk usage mid-move, or block for hours during peak traffic.",
-        fix="Review the plan before running citus_rebalance_start(). If disk amp > 1.5x or runtime too long, raise citus.max_background_task_executors_per_node or split the job by colocation group.",
+        checks=GUIDANCE["R2"]["checks"],
+        matters=GUIDANCE["R2"]["matters"],
+        fix=GUIDANCE["R2"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-rebalance-start",
     ),
     "REF1": dict(
         cat="data",
-        checks="Reference tables: size per copy, number of placements, and drift between workers.",
-        matters="Reference tables are fully replicated to every worker. A 1 GB reference table costs 1 GB × n_workers of disk and slows down every write by 2PC across the cluster.",
-        fix="If oversized: convert heavy-write reference tables to distributed. If drift: citus_copy_reference_table_placements() to repair. Aim to keep reference tables under 100 MB each.",
+        checks=GUIDANCE["REF1"]["checks"],
+        matters=GUIDANCE["REF1"]["matters"],
+        fix=GUIDANCE["REF1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/reference_ddl.html#reference-tables",
     ),
     "W1": dict(
         cat="ops",
-        checks="WAL and checkpoint pressure: wal_buffers size, checkpoint trigger mix, archiver health, replication slot lag, durability settings.",
-        matters="Too-frequent requested checkpoints cause I/O stalls. Tiny wal_buffers serialize writes. fsync=off risks corruption. Orphaned replication slots retain WAL forever and fill the disk.",
-        fix="Raise wal_buffers to at least 16 MB. Tune max_wal_size so checkpoints are mostly timed, not requested. Drop unused replication slots. Verify fsync=on and full_page_writes=on.",
+        checks=GUIDANCE["W1"]["checks"],
+        matters=GUIDANCE["W1"]["matters"],
+        fix=GUIDANCE["W1"]["fix"],
         docs="https://www.postgresql.org/docs/current/wal-configuration.html",
     ),
     "STAT1": dict(
         cat="perf",
-        checks="Last_analyze / last_autoanalyze per shard; tables with significant change since the last ANALYZE; never-analyzed tables.",
-        matters="Stale stats cause the planner to pick wrong join orders, seq-scan instead of index-scan, or badly underestimate row counts on distributed queries. Every worker gets the same bad plan.",
-        fix="Run ANALYZE on flagged tables. For chronically stale ones, lower autovacuum_analyze_scale_factor per-table. Consider CREATE STATISTICS for correlated join-key columns.",
+        checks=GUIDANCE["STAT1"]["checks"],
+        matters=GUIDANCE["STAT1"]["matters"],
+        fix=GUIDANCE["STAT1"]["fix"],
         docs="https://www.postgresql.org/docs/current/planner-stats.html",
     ),
     "SEC1": dict(
         cat="security",
-        checks="Superuser inventory, password hash methods, PUBLIC grants on distributed tables, extension version drift, weak pg_hba rules.",
-        matters="md5 and no-password accounts are phishing-and-sniff vulnerable. PUBLIC grants on distributed tables let any login read them. Extension drift blocks upgrade or causes per-node behavior differences.",
-        fix="Migrate md5 → scram-sha-256: ALTER USER ... PASSWORD to re-hash. Revoke PUBLIC on distributed tables. Align extensions to the same version on every node.",
+        checks=GUIDANCE["SEC1"]["checks"],
+        matters=GUIDANCE["SEC1"]["matters"],
+        fix=GUIDANCE["SEC1"]["fix"],
         docs="https://www.postgresql.org/docs/current/auth-password.html",
     ),
     "NET1": dict(
         cat="avail",
-        checks="Node-to-node connectivity matrix and coord→node latency.",
-        matters="Citus assumes any node can reach any other node. Asymmetric connectivity (A→B ok but B→A fails) silently breaks MX queries and 2PC commits mid-flight.",
-        fix="For unreachable pairs: fix firewall, routing, or pg_hba.conf. For high RTT: move the offending node into the same availability zone as the coordinator.",
+        checks=GUIDANCE["NET1"]["checks"],
+        matters=GUIDANCE["NET1"]["matters"],
+        fix=GUIDANCE["NET1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-check-connection-to-node",
     ),
     "REP1": dict(
         cat="avail",
-        checks="Streaming replication senders, replica replay lag, replication slots with WAL retention, recovery state.",
-        matters="High replay lag means your HA standby is not actually protecting you. An orphan slot retains WAL forever and will fill the disk. Wrong synchronous_commit + synchronous_standby_names combinations can freeze writes entirely.",
-        fix="For lag: check replica I/O and reduce write pressure. For orphan slots: pg_drop_replication_slot() after confirming no standby needs them. Review HA topology before changing sync settings.",
+        checks=GUIDANCE["REP1"]["checks"],
+        matters=GUIDANCE["REP1"]["matters"],
+        fix=GUIDANCE["REP1"]["fix"],
         docs="https://www.postgresql.org/docs/current/warm-standby.html#STREAMING-REPLICATION",
     ),
     "GR1": dict(
         cat="memory",
-        checks="How much extra memory per backend is needed as the cluster grows more shards or partitions (relation cache + plan cache + lock-hash).",
-        matters="Per-backend memory scales with shard count. Growing from 32 to 256 shards can 10x the resident set of every backend. This is the #1 reported cause of OOM complaints after aggressive sharding.",
-        fix="Before adding shards: raise RAM per node per the advisor's projection, or lower max_connections so fewer backends share the budget. Consider citus.max_cached_conns_per_worker tuning.",
+        checks=GUIDANCE["GR1"]["checks"],
+        matters=GUIDANCE["GR1"]["matters"],
+        fix=GUIDANCE["GR1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_guc.html",
     ),
     "C3": dict(
         cat="conn",
-        checks="The maximum external client connections the cluster can safely handle, given inbound limits, outbound MX pool fan-out, and internal quotas.",
-        matters="Every client query fans out to workers. Miss the cap and workers run out of connections first — the cluster returns 'too many connections' errors and stays that way until load drops.",
-        fix="Sit pgbouncer in front of the coordinator (and every MX node) at the pool size shown. If worst-case is already low, raise max_connections on workers or lower citus.max_adaptive_executor_pool_size.",
+        checks=GUIDANCE["C3"]["checks"],
+        matters=GUIDANCE["C3"]["matters"],
+        fix=GUIDANCE["C3"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_guc.html#citus-max-shared-pool-size",
     ),
     "S3": dict(
         cat="data",
-        checks="Size skew across shards of each colocation group, and byte balance across workers.",
-        matters="A single hot shard (one big tenant, one hot key) can saturate one worker's CPU/disk while others idle. Rebalancer can't fix it if the skew is inside the hash range — only redistribution or tenant isolation can.",
-        fix="For tenant hot spots: move the tenant to its own table/schema (schema-based sharding) or use CITUS_ISOLATE_TENANT_TO_NEW_SHARD. For key skew: rechoose distribution column to a higher-cardinality key.",
+        checks=GUIDANCE["S3"]["checks"],
+        matters=GUIDANCE["S3"]["matters"],
+        fix=GUIDANCE["S3"]["fix"],
         docs="https://docs.citusdata.com/en/stable/sharding/data_modeling.html",
     ),
     "R1": dict(
         cat="ops",
-        checks="Citus background job and task queue: stuck steps, failed jobs, cleanup backlog from deferred shard drops.",
-        matters="A stuck rebalance holds shard locks that block DDL and shard moves forever. A cleanup backlog means dropped shards are still consuming disk.",
-        fix="For stuck jobs: inspect pg_dist_background_job / _task and citus_rebalance_stop() + diagnose. For cleanup backlog: call citus_cleanup_orphaned_resources() manually.",
+        checks=GUIDANCE["R1"]["checks"],
+        matters=GUIDANCE["R1"]["matters"],
+        fix=GUIDANCE["R1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-rebalance-stop",
     ),
     "N6": dict(
         cat="ops",
-        checks="Whether add_node will succeed given the current metadata payload size, lock-hash sizing, expected wall-time, and memory needed during sync.",
-        matters="Metadata sync on a too-small new node silently times out or OOMs half-way, leaving the cluster in a mixed state that blocks every subsequent admin operation.",
-        fix="Use the recommended add-node mode (transactional vs nontransactional) and pre-size max_locks_per_transaction on the new node. Prepare the node with matching extensions and types before calling citus_add_node.",
+        checks=GUIDANCE["N6"]["checks"],
+        matters=GUIDANCE["N6"]["matters"],
+        fix=GUIDANCE["N6"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-add-node",
     ),
     "A3": dict(
         cat="avail",
-        checks="Prepared 2PC transactions on workers that the coordinator doesn't know about (orphans).",
-        matters="Orphaned prepared transactions hold locks forever, block VACUUM, and prevent shard moves. Eventually they exhaust xid space and trigger cluster-wide reads-only shutdown.",
-        fix="Run SELECT recover_prepared_transactions() on the coordinator. If that doesn't clear them, ROLLBACK PREPARED each GID manually after confirming no replay is expected.",
+        checks=GUIDANCE["A3"]["checks"],
+        matters=GUIDANCE["A3"]["matters"],
+        fix=GUIDANCE["A3"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#recover-prepared-transactions",
     ),
     "SC1": dict(
         cat="data",
-        checks="Per-colocation-group shard count against the amount of data actually stored.",
-        matters="Too few shards bottlenecks parallelism to a small number of workers. Too many shards bloats every backend's metadata cache and planning cost, and slows every distributed query.",
-        fix="Use alter_distributed_table or undistribute_table + create_distributed_table to rebuild at the recommended count. A common rule of thumb is 1-2x the worker count per colocation group.",
+        checks=GUIDANCE["SC1"]["checks"],
+        matters=GUIDANCE["SC1"]["matters"],
+        fix=GUIDANCE["SC1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#alter-distributed-table",
     ),
     "P2": dict(
         cat="data",
-        checks="Whether pg_dist_placement.shardlength matches the real on-disk size of each shard.",
-        matters="The rebalancer picks moves from shardlength. Stale (often 0) values make it pick the wrong moves or declare the cluster balanced when it isn't.",
-        fix="Run SELECT citus_update_table_statistics('<table>') for each affected distributed table, then re-check the rebalance plan before starting a rebalance.",
+        checks=GUIDANCE["P2"]["checks"],
+        matters=GUIDANCE["P2"]["matters"],
+        fix=GUIDANCE["P2"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_udf.html#citus-update-table-statistics",
     ),
     "MX1": dict(
         cat="conn",
-        checks="On each MX-metadata-synced node: how many client connection slots remain after subtracting inbound mesh fan-in and system reservations.",
-        matters="In MX mode every other node can open pool connections to this node. If mesh + system reserve already eats most of max_connections, a spike in client traffic overflows immediately.",
-        fix="Raise max_connections on every MX node, or lower citus.max_adaptive_executor_pool_size to cap the per-peer fan-in.",
+        checks=GUIDANCE["MX1"]["checks"],
+        matters=GUIDANCE["MX1"]["matters"],
+        fix=GUIDANCE["MX1"]["fix"],
         docs="https://docs.citusdata.com/en/stable/develop/api_guc.html#citus-max-adaptive-executor-pool-size",
     ),
 }
@@ -679,19 +389,9 @@ ADVISOR_META = {
 
 SEV_ORDER    = ["CRITICAL", "WARN", "INFO", "OK"]
 SEV_TO_CLASS = {"CRITICAL": "crit", "WARN": "warn", "INFO": "info", "OK": "ok"}
-SEV_LABEL    = {"crit": "CRITICAL", "warn": "WARN", "info": "INFO", "ok": "OK", "unk": "—"}
+SEV_LABEL = {"crit": "Urgent", "warn": "Review", "info": "Information", "ok": "No issue found", "unk": "Not fully checked"}
 # overall-escalation rank (higher = worse); INFO never escalates.
-ESCALATE = {"crit": 3, "warn": 2, "ok": 1, "info": 0, "unk": 0}
-
-
-def worst_verdict(text: str) -> tuple[str, str]:
-    """Return (severity-class, headline). Most severe match wins."""
-    for sev in SEV_ORDER:
-        m = re.search(rf'^\s*\|?\s*{sev}\s*:[^\n|]*', text, re.M)
-        if m:
-            line = m.group(0).lstrip().lstrip("|").strip().rstrip("|").strip()
-            return SEV_TO_CLASS[sev], line
-    return "unk", "(no verdict headline)"
+ESCALATE = {"crit": 4, "warn": 3, "unk": 2, "ok": 1, "info": 0}
 
 
 # --- gather.out section parsing --------------------------------------------
@@ -835,19 +535,22 @@ def build_fingerprint(sections: list[tuple[str, str]]) -> list[tuple[str, str, s
     topo = _section_rows(sections, "cluster_topology")
     if topo:
         active = [r for r in topo if r.get("isactive") in ("t", "true", "1")]
-        coord  = [r for r in active if r.get("groupid") in ("0", 0)]
-        workers = [r for r in active if r.get("groupid") not in ("0", 0)]
-        mx_count = sum(1 for r in active if r.get("hasmetadata") in ("t", "true", "1"))
+        primaries = [r for r in active if r.get('noderole') == 'primary']
+        coord = [r for r in primaries if r.get('groupid') in ('0', 0)]
+        workers = [r for r in primaries if r.get('groupid') not in ('0', 0)]
+        mx_count = sum(1 for r in primaries if r.get("hasmetadata") in ("t", "true", "1"))
+        synced = sum(1 for r in primaries if r.get('hasmetadata') in ('t', 'true', '1')
+               and r.get('metadatasynced') in ('t', 'true', '1'))
         mode = "MX" if mx_count > 1 else "classic"
         tiles.append(("Nodes", f"{len(active)}",
-                      f"{len(coord)} coord + {len(workers)} worker(s)"))
+                      f"{len(coord)} coord + {len(workers)} primary worker(s); {len(active)-len(primaries)} other node(s)"))
         tiles.append(("Cluster mode", mode,
-                      f"{mx_count} metadata-synced" if mx_count else "no MX"))
+                      f"{mx_count} metadata-bearing; {synced} marked synced"))
 
     parts = _section_rows(sections, "pg_dist_partition")
     if parts:
-        dist = [r for r in parts if r.get("partmethod") == "h"]
-        ref  = [r for r in parts if r.get("partmethod") == "n"]
+        dist = [r for r in parts if r.get("partmethod") in ('h', 'r', 'a')]
+        ref = [r for r in parts if r.get('partmethod') == 'n' and r.get('repmodel') == 't']
         tiles.append(("Distributed tables", str(len(dist)),
                       f"{len(ref)} reference" if ref else ""))
 
@@ -872,7 +575,7 @@ def build_fingerprint(sections: list[tuple[str, str]]) -> list[tuple[str, str, s
         except Exception:
             tb = 0
         if tb:
-            tiles.append(("Total data size", _fmt_bytes(tb), ""))
+            tiles.append(("Placement bytes", _fmt_bytes(tb), "includes reference copies and replicas"))
 
     return tiles
 
@@ -987,7 +690,16 @@ body {
   max-width: 1440px; margin: 0 auto; padding: 1.75rem 2rem 5rem;
   display: grid; grid-template-columns: 260px minmax(0,1fr); gap: 2.25rem;
 }
-@media (max-width: 1100px) { .wrap { grid-template-columns: 1fr; padding: 1rem; } }
+.wrap > *, .hero > *, .adv .panes > * { min-width: 0; }
+.memory-plan { margin: 2rem 0; padding: 1rem 0; border-top: 1px solid var(--border); scroll-margin-top: 150px; }
+.memory-plan p { line-height: 1.6; }
+.memory-plan h3 { margin-top: 1.5rem; font-size: 1.1rem; }
+.memory-table { width: 100%; min-width: 820px; border-collapse: collapse; overflow-wrap: normal; }
+.memory-table th, .memory-table td { padding: .65rem; text-align: left; border-bottom: 1px solid var(--border); }
+.memory-table th { min-width: 105px; font-size: .85rem; }
+.memory-table td { white-space: nowrap; }
+.memory-table th:first-child { min-width: 180px; }
+@media (max-width: 1100px) { .wrap { grid-template-columns: minmax(0,1fr); padding: 1rem; } }
 
 /* Sticky top bar */
 .topbar {
@@ -1500,7 +1212,7 @@ h2.section .descr { color: var(--mut); font-weight: 400; font-size: 14px; margin
 /* Summary table */
 .card {
   background: var(--card); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  border-radius: var(--radius); box-shadow: var(--shadow); overflow: auto;
 }
 table.summary { width: 100%; border-collapse: collapse; }
 table.summary th, table.summary td {
@@ -1728,6 +1440,14 @@ table.csv tr:nth-child(even) td { background: rgba(127,127,127,.04); }
                 background: rgba(127,127,127,.12); border-radius: 4px; }
 
 /* Print */
+@media (max-width: 800px) {
+  .topbar { flex-wrap: wrap; position: static; padding: .75rem 1rem; gap: .5rem; }
+  .topbar > a, .topbar > .spacer { display: none; }
+  .topbar > h1 { min-width: 0; flex: 1; font-size: 1.1rem; }
+  .fingerstrip { position: static; }
+  .wrap { overflow-wrap: anywhere; }
+}
+
 @media print {
   @page { margin: 16mm 14mm; }
   html, body { background: #fff !important; color: #000 !important; }
@@ -1849,7 +1569,7 @@ JS = r"""
         var sevOk = !activeSev.size || activeSev.has(sev);
         var catOk = !activeCat.size || activeCat.has(cat);
         var qOk = !query || txt.indexOf(query) !== -1;
-        var passOk = !passes || showPassing || (activeSev.size && activeSev.has(sev));
+        var passOk = !passes || showPassing || Boolean(query) || (activeSev.size && activeSev.has(sev));
         var ok = sevOk && catOk && qOk && passOk;
         if (ok) { tr.removeAttribute('hidden-row'); shown++; }
         else { tr.setAttribute('hidden-row', ''); }
@@ -1862,8 +1582,8 @@ JS = r"""
           if (sev === 'ok' || sev === 'info') passCount++;
         });
         passBtn.textContent = showPassing
-          ? 'Hide ' + passCount + ' passing checks'
-          : 'Show ' + passCount + ' passing checks';
+          ? 'Hide ' + passCount + ' other results'
+          : 'Show ' + passCount + ' other results';
       }
     }
 
@@ -1912,7 +1632,7 @@ JS = r"""
           copyBtn.textContent = 'Copied ✓';
           copyBtn.classList.add('copied');
           setTimeout(function () {
-            copyBtn.textContent = 'Copy playbook';
+            copyBtn.textContent = 'Copy next steps';
             copyBtn.classList.remove('copied');
           }, 1500);
         });
@@ -1926,7 +1646,7 @@ JS = r"""
         copyBtn.textContent = 'Copied ✓';
         copyBtn.classList.add('copied');
         setTimeout(function () {
-          copyBtn.textContent = 'Copy playbook';
+          copyBtn.textContent = 'Copy next steps';
           copyBtn.classList.remove('copied');
         }, 1500);
       }
@@ -2036,14 +1756,14 @@ def _section_cat_pill(cat_key: str) -> str:
 
 def _playbook_plaintext(playbook: list) -> str:
     """A copy-pasteable text version of the playbook for the clipboard."""
-    lines = ["citus_analyze — remediation playbook", "=" * 40, ""]
+    lines = ["citus_analyze - suggested next steps", "=" * 40, ""]
     for i, item in enumerate(playbook, 1):
         aid, title, sev, hl, fix = item
         lines.append(f"{i}. [{SEV_LABEL[sev]}] {aid} — {title}")
         if hl:
             lines.append(f"   Finding: {hl}")
         if fix:
-            lines.append(f"   Fix:     {fix}")
+            lines.append(f"   Next step: {fix}")
         lines.append("")
     return "\n".join(lines)
 
@@ -2053,15 +1773,22 @@ def render(run_dir: Path, out_path: Path) -> None:
     results = []   # (aid, title, blurb, sev, headline, rec, text)
     counts = {"ok": 0, "warn": 0, "crit": 0, "info": 0, "unk": 0}
     overall = "ok"
+    incomplete = 0
+    source_results = {}
 
     for aid, title, blurb, extract_rec in ADVISORS:
+        result = read_result(run_dir, aid)
+        source_results[aid] = result
+        sev, hl = result['severity'], plain_summary(aid, result)
+        if aid == 'M1' and result.get('analysis') and result['collection_status'] == 'complete' and sev in ('ok', 'info'):
+            hl = capacity_summary(result['analysis'])
+        incomplete += result['collection_status'] == 'incomplete'
         p = run_dir / f"{aid}.out"
         if p.exists():
             text = p.read_text(errors="replace")
-            sev, hl = worst_verdict(text)
-            rec = extract_rec(text) or ''
+            rec = (extract_rec(text) or '') if result['collection_status'] == 'complete' else 'Resolve missing data or access problems, then run this check again.'
         else:
-            text, sev, hl, rec = "", "unk", f"(missing: {aid}.out)", ""
+            text, rec = "", "Run this check again to collect the missing results."
         results.append((aid, title, blurb, sev, hl, rec, text))
         counts[sev] += 1
         if ESCALATE[sev] > ESCALATE[overall]:
@@ -2078,8 +1805,13 @@ def render(run_dir: Path, out_path: Path) -> None:
     # Collection-time redaction state (from meta section, written by
     # citus_gather.sql). Absent column means older gather without redaction.
     meta_rows = _section_rows(sections, "meta")
-    redaction_on = bool(meta_rows and
-                        str(meta_rows[0].get("query_redaction", "")).lower() == "on")
+    gather_errors = run_dir / 'gather.err'
+    gather_status = run_dir / 'gather.status'
+    gather_incomplete = bool(not sections or (gather_status.exists() and gather_status.read_text().strip() != '0')
+                             or (gather_errors.exists() and re.search(r'(?:ERROR|FATAL|PANIC):', gather_errors.read_text(errors='replace'))))
+    if gather_incomplete and ESCALATE[overall] < ESCALATE['unk']:
+        overall = 'unk'
+    ov_label = SEV_LABEL[overall]
 
     # 2. Pre-compute derived views ------------------------------------------
     top_fixes = [r for r in results if r[3] in ("crit", "warn")]
@@ -2090,7 +1822,7 @@ def render(run_dir: Path, out_path: Path) -> None:
     playbook = []
     for aid, title, _blurb, sev, hl, _rec, _text in top_fixes:
         meta = ADVISOR_META.get(aid, {})
-        playbook.append((aid, title, sev, hl, meta.get("fix", "")))
+        playbook.append((aid, title, sev, hl, _rec or 'Check the finding and its assumptions before changing settings.'))
 
     # Sorted summary rows: crit -> warn -> info -> ok (stable).
     sorted_results = sorted(
@@ -2125,9 +1857,10 @@ def render(run_dir: Path, out_path: Path) -> None:
     a(f'<h1>{LOGO_SVG}citus_analyze {_sev_badge(overall)}</h1>')
     a('<div class="spacer"></div>')
     a('<a href="#summary">Summary</a>')
-    a('<a href="#playbook">Playbook</a>')
-    a('<a href="#advisors">Advisors</a>')
-    a('<a href="#snapshot">Snapshot</a>')
+    a('<a href="#memory-planning">Memory</a>')
+    a('<a href="#playbook">Next steps</a>')
+    a('<a href="#advisors">Checks</a>')
+    a('<a href="#snapshot">Collected data</a>')
     a('<button class="print-btn" id="print-report" type="button">Print / PDF</button>')
     a('</div>')
 
@@ -2154,18 +1887,19 @@ def render(run_dir: Path, out_path: Path) -> None:
     a('<aside class="sidebar" aria-label="Navigation">')
     a('<div class="mini-verdict">')
     a(f'<span class="big {overall}">{html.escape(ov_label)}</span>')
-    a(f'<span class="meta">{counts["crit"]} critical &middot; {counts["warn"]} warn &middot; '
-      f'{counts["ok"]} ok &middot; {counts["info"]} info</span>')
+    a(f'<span class="meta">{counts["crit"]} urgent &middot; {counts["warn"]} to review &middot; '
+      f'{counts["ok"]} with no issue found &middot; {counts["info"]} for information &middot; {incomplete} incomplete</span>')
     a('</div>')
     a('<details class="nav-group" open><summary>Sections</summary>')
     a('<div class="group-body">')
     a('<a href="#summary"><span>Executive summary</span></a>')
+    a('<a href="#memory-planning"><span>Memory and room to grow</span></a>')
     if playbook:
-        a('<a href="#playbook"><span>Remediation playbook</span></a>')
-    a('<a href="#snapshot"><span>Cluster snapshot</span></a>')
+        a('<a href="#playbook"><span>Suggested next steps</span></a>')
+    a('<a href="#snapshot"><span>Collected data</span></a>')
     a('</div></details>')
 
-    a('<details class="nav-group" open><summary>Advisors by category</summary>')
+    a('<details class="nav-group" open><summary>Checks by category</summary>')
     a('<div class="group-body">')
     for k in present_cats:
         lbl, color = CATEGORIES[k]
@@ -2186,38 +1920,26 @@ def render(run_dir: Path, out_path: Path) -> None:
     a('<main>')
 
     # --- Privacy / handling banner ---
-    if redaction_on:
-        a('<div class="privacy" role="note" aria-label="Privacy notice">'
-          '<span class="pico" aria-hidden="true">🛡</span>'
-          '<div><strong>Privacy:</strong> query text in this report has been '
-          'redacted at collection time &mdash; single-quoted string literals '
-          'are replaced with <code>&lt;literal&gt;</code>. SQL shape is '
-          'preserved for analysis; user data in <code>WHERE</code> clauses, '
-          '<code>VALUES</code>, and parameters is removed. Dollar-quoted '
-          'bodies and numeric literals pass through. This is still a '
-          'diagnostic report &mdash; treat it as internal and share only '
-          'with people who should see cluster topology, placements, and '
-          'query shapes.</div></div>')
-    else:
-        a('<div class="privacy" role="note" aria-label="Privacy notice">'
-          '<span class="pico" aria-hidden="true">⚠</span>'
-          '<div><strong>Privacy:</strong> this report was produced by an '
-          'older <code>citus_gather.sql</code> without collection-time '
-          'redaction, so the embedded <code>query</code> columns may '
-          'contain literal user data (emails, IDs, tokens). Treat the '
-          'report as <strong>confidential</strong>. Re-run with the '
-          'current <code>citus_gather.sql</code> to produce a redacted '
-          'version.</div></div>')
+    a('<div class="privacy" role="note" aria-label="Privacy notice">'
+      '<div><strong>Confidential report.</strong> Server addresses, names and error messages may contain sensitive information. '
+      'Older reports may also contain query text. Review all report files before sharing.</div></div>')
+    if incomplete or gather_incomplete:
+        a(f'<p role="alert"><strong>Collection incomplete:</strong> {incomplete} check(s) could not finish; '
+          f'the data snapshot is {"incomplete or missing" if gather_incomplete else "available"}. '
+          'Resolve missing data or access problems before relying on these results.</p>')
 
     # --- Hero ---
     a('<section class="hero">')
     a('<div>')
     a('<h2>Cluster health report</h2>')
     a(f'<div class="sub">run: <code>{html.escape(run_dir.name)}</code> &middot; '
-      f'rendered {now} &middot; {total} advisors, {len(sections)} snapshot sections</div>')
+      f'created {now} &middot; {total} checks, {len(sections)} data sections</div>')
+    a('<p class="sub">Urgent = prompt attention needed. Review = check the finding before taking action. '
+      'Information = context or a planning estimate, not necessarily a fault. '
+      'No issue found applies only to the checks that ran.</p>')
     # Severity bar
     a('<div class="sev-bar" aria-label="Severity distribution">')
-    for sev_key in ("crit", "warn", "info", "ok"):
+    for sev_key in ("crit", "warn", "unk", "info", "ok"):
         c = counts.get(sev_key, 0)
         pct = (c / total * 100) if total else 0
         if c:
@@ -2225,22 +1947,23 @@ def render(run_dir: Path, out_path: Path) -> None:
               f'title="{c} {SEV_LABEL[sev_key]}"></div>')
     a('</div>')
     a('<div class="sev-legend">'
-      f'<span><span class="dot crit"></span>{counts["crit"]} critical</span>'
-      f'<span><span class="dot warn"></span>{counts["warn"]} warn</span>'
-      f'<span><span class="dot info"></span>{counts["info"]} info</span>'
-      f'<span><span class="dot ok"></span>{counts["ok"]} ok</span>'
+      f'<span><span class="dot crit"></span>{counts["crit"]} urgent</span>'
+      f'<span><span class="dot warn"></span>{counts["warn"]} to review</span>'
+      f'<span><span class="dot info"></span>{counts["info"]} for information</span>'
+      f'<span><span class="dot ok"></span>{counts["ok"]} with no issue found</span>'
+      f'<span><span class="dot unk"></span>{counts["unk"]} not fully checked</span>'
       '</div>')
     # Top fixes
     a('<div class="topfix">')
-    a(f'<h3>Top things to fix <span class="cnt">{len(top_fixes)}</span></h3>')
+    a(f'<h3>What needs attention <span class="cnt">{len(top_fixes)}</span></h3>')
     if not top_fixes:
-        a('<div class="empty">✓ Nothing urgent. Review INFO items below when you have time.</div>')
+        a('<div class="empty">No urgent or review findings in the available data. Check any missing results and planning estimates below.</div>')
     else:
         a('<ol>')
         for i, (aid, title, _b, sev, hl, _rec, _t) in enumerate(top_fixes[:5], 1):
             meta = ADVISOR_META.get(aid, {})
             cat_pill = _cat_pill(meta.get("cat", "config"))
-            fix = meta.get("fix", "")
+            fix = _rec or 'Check the finding and its assumptions before changing settings.'
             fix_html = ''
             if fix:
                 fix_html = (
@@ -2250,7 +1973,7 @@ def render(run_dir: Path, out_path: Path) -> None:
                     'stroke-linejoin="round">'
                     '<path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>'
                     '</svg>'
-                    f'<div><b>Fix</b>{html.escape(fix)}</div></div>'
+                    f'<div><b>Next step</b>{html.escape(fix)}</div></div>'
                 )
             a(f'<li class="sev-{sev}"><span class="num">{i}</span><div class="body">'
               f'<div class="title-line">{_sev_badge(sev)}'
@@ -2287,7 +2010,7 @@ def render(run_dir: Path, out_path: Path) -> None:
         a('</div>')
     a('</div>')
     a(f'<div class="verdict {overall}">'
-      f'<span class="lbl">Overall verdict</span>'
+      f'<span class="lbl">Overall status</span>'
       f'<span class="big">{SEV_ICON.get(overall,"")}{html.escape(ov_label)}</span>'
       '<div class="counts">'
       f'<span><span class="dot crit"></span>{counts["crit"]}</span>'
@@ -2296,6 +2019,9 @@ def render(run_dir: Path, out_path: Path) -> None:
       f'<span><span class="dot ok"></span>{counts["ok"]}</span>'
       '</div></div>')
     a('</section>')
+
+    memory_result = source_results.get('M1', {})
+    a(render_capacity(memory_result.get('analysis'), memory_result.get('collection_status') == 'complete'))
 
     # --- "All recommendations" section removed: critical + warn
     # recommendations are surfaced directly inside the hero
@@ -2310,14 +2036,14 @@ def render(run_dir: Path, out_path: Path) -> None:
 
     # --- Playbook ---
     if playbook:
-        a(f'<h2 class="section" id="playbook">Remediation playbook'
+        a(f'<h2 class="section" id="playbook">Suggested next steps'
           f'<span class="count">{len(playbook)} actions</span>'
-          '<span class="descr">prioritised by severity</span></h2>')
+          '<span class="descr">most important first</span></h2>')
         a('<div class="playbook">')
         a('<header>'
-          f'<h3>Do these in order</h3>'
-          f'<span class="count">critical first, then warn</span>'
-          '<button class="copy-btn" id="playbook-copy" type="button">Copy playbook</button>'
+          f'<h3>Review with your database team</h3>'
+          f'<span class="count">urgent findings first</span>'
+          '<button class="copy-btn" id="playbook-copy" type="button">Copy next steps</button>'
           '</header>')
         a('<ol>')
         for aid, title, sev, hl, fix in playbook:
@@ -2340,15 +2066,14 @@ def render(run_dir: Path, out_path: Path) -> None:
 
     # --- Executive summary ---
     a(f'<h2 class="section" id="summary">Executive summary'
-      f'<span class="count">{total} advisors</span>'
-      '<span class="descr">filter, search, and drill in</span></h2>')
+      f'<span class="count">{total} checks</span></h2>')
 
     # Filter bar
     a('<div class="filter-bar">')
-    a('<input type="search" id="summary-search" placeholder="Search advisors…" '
+    a('<input type="search" id="summary-search" placeholder="Search checks..." '
       'autocomplete="off" spellcheck="false">')
-    a('<span class="sep">severity</span>')
-    for sev_key in ("crit", "warn", "info", "ok"):
+    a('<span class="sep">status</span>')
+    for sev_key in ("crit", "warn", "unk", "info", "ok"):
         lbl = SEV_LABEL[sev_key]
         c = counts.get(sev_key, 0)
         a(f'<button class="chip sev-{sev_key}" data-sev="{sev_key}" type="button" aria-pressed="false">'
@@ -2364,12 +2089,12 @@ def render(run_dir: Path, out_path: Path) -> None:
 
     a('<div class="card"><table class="summary">')
     a('<thead><tr>'
-      '<th class="col-sev">Severity</th>'
+      '<th class="col-sev">Status</th>'
       '<th class="col-cat">Category</th>'
       '<th class="col-id">ID</th>'
-      '<th class="col-name">Advisor</th>'
-      '<th>Current finding</th>'
-      '<th class="col-rec">Recommended</th>'
+      '<th class="col-name">Check</th>'
+      '<th>What we found</th>'
+      '<th class="col-rec">Next step</th>'
       '</tr></thead><tbody>')
     for aid, title, _blurb, sev, hl, rec, _text in sorted_results:
         meta = ADVISOR_META.get(aid, {})
@@ -2387,13 +2112,13 @@ def render(run_dir: Path, out_path: Path) -> None:
           f'<td>{rec_cell}</td>'
           '</tr>')
     a('</tbody></table>')
-    a('<div class="summary-empty" id="summary-empty">No advisors match the current filters.</div>')
+    a('<div class="summary-empty" id="summary-empty">No checks match the current filters.</div>')
     a('</div>')
-    a('<div class="pass-toggle"><button id="pass-toggle-btn" type="button">Show passing checks</button></div>')
+    a('<div class="pass-toggle"><button id="pass-toggle-btn" type="button">Show other results</button></div>')
 
     # --- Per-advisor cards ---
-    a(f'<h2 class="section" id="advisors">Advisor details'
-      f'<span class="count">{total} advisors</span></h2>')
+    a(f'<h2 class="section" id="advisors">Check details'
+      f'<span class="count">{total} checks</span></h2>')
     for aid, title, blurb, sev, hl, rec, text in sorted_results:
         meta = ADVISOR_META.get(aid, {})
         cat_key = meta.get("cat", "config")
@@ -2430,15 +2155,16 @@ def render(run_dir: Path, out_path: Path) -> None:
               '<span class="rec-lbl">Recommended</span>'
               f'<span class="rec-val">{html.escape(rec)}</span></div>')
         if text:
+            text = '\n'.join(line for line in text.splitlines() if not line.startswith(PREFIX))
             n_lines = len(text.splitlines())
             a(f'<details><summary>Technical details ({aid}.out &middot; {n_lines} lines)</summary>'
               f'<pre class="raw">{html.escape(text)}</pre></details>')
         a('</div>')
 
     # --- Snapshot ---
-    a(f'<h2 class="section" id="snapshot">Cluster snapshot'
+    a(f'<h2 class="section" id="snapshot">Collected data'
       f'<span class="count">{len(sections)} sections</span>'
-      '<span class="descr">raw data from citus_gather</span></h2>')
+      '<span class="descr">technical data recorded during this run</span></h2>')
     if not sections:
         a('<p class="muted"><em>No gather.out found or no sections parsed.</em></p>')
     else:
@@ -2477,9 +2203,8 @@ def render(run_dir: Path, out_path: Path) -> None:
             a('</details>')
 
     if summary_txt:
-        a('<h2 class="section" id="txt">Driver summary.txt'
-          '<span class="descr">stdout from citus_analyze.sh</span></h2>')
-        a(f'<pre class="raw">{html.escape(summary_txt)}</pre>')
+        a('<details id="txt"><summary>Technical run log (summary.txt)</summary>')
+        a(f'<pre class="raw">{html.escape(summary_txt)}</pre></details>')
 
     a('</main>')
     a('</div>')  # .wrap

@@ -32,16 +32,9 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 -- ---------------------------------------------------------------------
 -- Redaction policy
 -- ----------------
--- Query-text columns collected from pg_stat_activity / pg_stat_statements
--- / citus_dist_stat_activity / citus_stat_statements are filtered with a
--- regex that replaces single-quoted string literals with the token
--- "<literal>". This preserves the SQL shape (so advisors and humans can
--- still read the query) while eliminating literal user data such as
--- emails, tokens, names, and IDs embedded as strings. The regex also
--- handles doubled-quote escapes ('') and E'...'''(?:''''|\\.|[^''\\])*'''..' escape strings.
--- Dollar-quoted bodies (used in PL/pgSQL function definitions) and
--- numeric literals are left as-is; redact those at the source if they
--- matter for your compliance posture.
+-- Query bodies and background command/message text are omitted, not
+-- regex-sanitized. Identities, object names, topology and error logs can
+-- still contain sensitive information; the entire bundle is confidential.
 --
 -- Sensitive GUCs (primary_conninfo, archive_command, restore_command,
 -- ssl_passphrase_command) are never collected by this script. The GUC
@@ -50,7 +43,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: meta
-\copy (SELECT now() AS collected_at, current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port, current_user AS collected_by, version() AS pg_version, citus_version() AS citus_version, 'on' AS query_redaction) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT now() AS collected_at, current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port, current_user AS collected_by, version() AS pg_version, citus_version() AS citus_version, 'omitted' AS query_redaction, 2 AS bundle_version) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : meta
 
 -- ---------------------------------------------------------------------
@@ -95,17 +88,17 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: pg_dist_transaction
-\copy (SELECT groupid, gid, outer_xid::text FROM pg_dist_transaction ORDER BY groupid, gid) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT groupid, gid, to_jsonb(transaction)->>'outer_xid' AS outer_xid FROM pg_dist_transaction transaction ORDER BY groupid, gid) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : pg_dist_transaction
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: pg_dist_background_job
-\copy (SELECT job_id, state::text, job_type::text, description, started_at, finished_at FROM pg_dist_background_job ORDER BY job_id) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT job_id, state::text, job_type::text, '[omitted]' AS description, started_at, finished_at FROM pg_dist_background_job ORDER BY job_id) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : pg_dist_background_job
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: pg_dist_background_task
-\copy (SELECT job_id, task_id, owner::text, pid, status::text, retry_count, not_before, left(command, 400) AS command, left(message, 400) AS message, nodes_involved FROM pg_dist_background_task ORDER BY job_id, task_id) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT job_id, task_id, owner::text, pid, status::text, retry_count, not_before, '[omitted]' AS command, '[omitted]' AS message, nodes_involved FROM pg_dist_background_task ORDER BY job_id, task_id) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : pg_dist_background_task
 
 -- ---------------------------------------------------------------------
@@ -120,7 +113,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: citus_gucs_coord
-\copy (SELECT name, setting, unit, category, short_desc, context, vartype, source, min_val, max_val, reset_val FROM pg_settings WHERE name LIKE 'citus.%' ORDER BY name) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT name, setting, unit, context, source FROM pg_settings WHERE name IN ('citus.max_shared_pool_size','citus.local_shared_pool_size','citus.max_client_connections','citus.max_adaptive_executor_pool_size','citus.metadata_sync_mode','citus.node_connection_timeout','citus.shard_count','citus.shard_replication_factor','citus.recover_2pc_interval','citus.max_background_task_executors_per_node','citus.enable_local_execution','citus.enable_repartition_joins','citus.multi_shard_modify_mode') ORDER BY name) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : citus_gucs_coord
 
 -- ---------------------------------------------------------------------
@@ -145,12 +138,12 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: pg_stat_activity_coord
-\copy (SELECT datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, state_change, backend_xmin::text, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM pg_stat_activity WHERE pid <> pg_backend_pid()) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, state_change, backend_xmin::text, '[omitted]' AS query FROM pg_stat_activity WHERE pid <> pg_backend_pid()) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : pg_stat_activity_coord
 
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: citus_dist_stat_activity
-\copy (SELECT global_pid, nodeid, pid, datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM citus_dist_stat_activity) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT global_pid, nodeid, pid, datname, usename, application_name, client_addr::text, state, wait_event_type, wait_event, backend_type, query_start, '[omitted]' AS query FROM citus_dist_stat_activity) TO STDOUT WITH (FORMAT csv, HEADER)
 \echo ### END : citus_dist_stat_activity
 
 -- ---------------------------------------------------------------------
@@ -192,7 +185,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 \echo ### BEGIN: pg_stat_statements_top
 \if :have_pgss
 -- Top 30 by total_exec_time
-\copy (SELECT queryid::text, calls, total_exec_time::numeric(20,2) AS total_ms, mean_exec_time::numeric(20,2) AS mean_ms, rows, shared_blks_hit, shared_blks_read, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'), 400) AS query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT queryid::text, calls, coalesce(to_jsonb(statement)->>'total_exec_time', to_jsonb(statement)->>'total_time')::numeric(20,2) AS total_ms, coalesce(to_jsonb(statement)->>'mean_exec_time', to_jsonb(statement)->>'mean_time')::numeric(20,2) AS mean_ms, rows, shared_blks_hit, shared_blks_read, '[omitted]' AS query FROM pg_stat_statements statement ORDER BY total_ms DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
 \else
 \echo -- skipped: pg_stat_statements extension not installed
 \endif
@@ -201,7 +194,7 @@ SELECT EXISTS (SELECT 1 FROM pg_views WHERE viewname='citus_stat_statements' AND
 -- ---------------------------------------------------------------------
 \echo ### BEGIN: citus_stat_statements_top
 \if :have_css
-\copy (SELECT queryid::text, left(regexp_replace(query, '''(?:''''|\\.|[^''\\])*''', '<literal>', 'g'),400) AS query, executor, partition_key, calls FROM public.citus_stat_statements ORDER BY calls DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
+\copy (SELECT queryid::text, '[omitted]' AS query, executor, '[omitted]' AS partition_key, calls FROM public.citus_stat_statements ORDER BY calls DESC LIMIT 30) TO STDOUT WITH (FORMAT csv, HEADER)
 \else
 \echo -- skipped: citus_stat_statements view not present (citus_stat_statements extension not installed)
 \endif

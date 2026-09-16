@@ -1,3 +1,5 @@
+\set advisor_id REF1
+\ir ../capabilities.sql
 -- REF1: Reference-table health.
 -- Reference tables are replicated in full to every worker that hosts
 -- placements. They enable local joins from any shard but cost RAM +
@@ -31,7 +33,7 @@
 -- Reference-table inventory (partmethod='n', repmodel='t').
 -- 'n' = non-distributed (Citus terminology: replicated to every worker),
 -- 't' = two-phase-commit-replicated (the reference-table flavor).
-DROP TABLE IF EXISTS _ref1_tables;
+DROP TABLE IF EXISTS pg_temp._ref1_tables;
 CREATE TEMP TABLE _ref1_tables AS
 SELECT
   p.logicalrelid::regclass::text  AS table_name,
@@ -48,15 +50,18 @@ WHERE p.partmethod = 'n' AND p.repmodel = 't';
 -- shouldhaveshards (the coord is included unless explicitly excluded via
 -- citus_set_node_property('shouldhaveshards',false) BEFORE the table was
 -- created; existing refs are NOT auto-removed from the coord on that flip).
-DROP TABLE IF EXISTS _ref1_expected;
+DROP TABLE IF EXISTS pg_temp._ref1_expected;
 CREATE TEMP TABLE _ref1_expected AS
 SELECT COUNT(*)::int AS expected_placements
 FROM pg_dist_node
 WHERE isactive = true
-  AND noderole = 'primary';
+  AND noderole = 'primary'
+  AND EXISTS (SELECT 1 FROM pg_dist_placement placement JOIN pg_dist_shard shard USING (shardid)
+              JOIN pg_dist_partition partition ON partition.logicalrelid=shard.logicalrelid
+              WHERE placement.groupid=pg_dist_node.groupid AND partition.partmethod IN ('h','r'));
 
 -- Per-placement size from citus_shards.
-DROP TABLE IF EXISTS _ref1_placements;
+DROP TABLE IF EXISTS pg_temp._ref1_placements;
 CREATE TEMP TABLE _ref1_placements AS
 SELECT
   cs.table_name::text        AS table_name,
@@ -65,14 +70,24 @@ SELECT
   cs.nodeport,
   cs.shard_size::bigint      AS shard_bytes
 FROM citus_shards cs
-WHERE cs.citus_table_type = 'reference';
+JOIN pg_dist_node node ON node.nodename=cs.nodename AND node.nodeport=cs.nodeport
+WHERE cs.citus_table_type = 'reference' AND node.isactive AND node.noderole='primary';
+
+SELECT 'INCOMPLETE : reference placement size unavailable; physical-size comparison is partial' AS finding
+WHERE EXISTS (SELECT 1 FROM _ref1_placements WHERE shard_bytes IS NULL);
 
 -- Summary per reference table.
-DROP TABLE IF EXISTS _ref1_summary;
+DROP TABLE IF EXISTS pg_temp._ref1_summary;
 CREATE TEMP TABLE _ref1_summary AS
 SELECT
   t.table_name,
   t.colocationid,
+  (SELECT count(*) FROM pg_dist_node node WHERE node.isactive AND node.noderole='primary'
+    AND EXISTS (SELECT 1 FROM pg_dist_placement placement JOIN pg_dist_shard shard USING (shardid)
+                JOIN pg_dist_partition partition ON partition.logicalrelid=shard.logicalrelid
+                WHERE placement.groupid=node.groupid AND partition.partmethod IN ('h','r'))
+    AND NOT EXISTS (SELECT 1 FROM _ref1_placements copy WHERE copy.table_name=t.table_name
+                    AND copy.nodename=node.nodename AND copy.nodeport=node.nodeport)) AS missing_required,
   COUNT(p.shardid)                                       AS actual_placements,
   COALESCE(MAX(p.shard_bytes), 0)::bigint                AS max_bytes,
   COALESCE(MIN(p.shard_bytes), 0)::bigint                AS min_bytes,
@@ -101,7 +116,7 @@ SELECT
   s.drift_pct::text || '%'                          AS size_drift,
   CASE
     WHEN s.actual_placements = 0 THEN 'no placements'
-    WHEN s.actual_placements < (SELECT expected_placements FROM _ref1_expected)
+    WHEN s.missing_required > 0
       THEN 'missing placements'
     WHEN s.actual_placements > (SELECT expected_placements FROM _ref1_expected)
       THEN 'extra placements'
@@ -119,7 +134,7 @@ SELECT
   (SELECT expected_placements FROM _ref1_expected)                            AS copies,
   pg_size_pretty(s.max_bytes * (SELECT expected_placements FROM _ref1_expected)) AS cluster_footprint,
   CASE
-    WHEN s.max_bytes >= (:ref1_size_crit_mb)::bigint * 1048576 THEN 'CRITICAL'
+    WHEN s.max_bytes >= (:ref1_size_crit_mb)::bigint * 1048576 THEN 'WARN'
     WHEN s.max_bytes >= (:ref1_size_warn_mb)::bigint * 1048576 THEN 'WARN'
     ELSE 'ok'
   END AS verdict
@@ -135,14 +150,14 @@ SELECT
   s.actual_placements,
   (SELECT expected_placements FROM _ref1_expected) AS expected_placements,
   CASE
-    WHEN s.actual_placements < (SELECT expected_placements FROM _ref1_expected)
-      THEN 'CRITICAL: run SELECT replicate_reference_tables();'
+    WHEN s.missing_required > 0
+      THEN 'WARN: required data-holding node lacks a reference copy; verify topology and supported replication procedure'
     WHEN s.actual_placements > (SELECT expected_placements FROM _ref1_expected)
-      THEN 'WARN: extra placements -- check pg_dist_cleanup and citus_cleanup_orphaned_resources()'
+      THEN 'INFO: additional copies may be intentional or retained during topology changes'
     ELSE 'ok'
   END AS recommendation
 FROM _ref1_summary s
-WHERE s.actual_placements <> (SELECT expected_placements FROM _ref1_expected);
+WHERE s.missing_required > 0 OR s.actual_placements <> (SELECT expected_placements FROM _ref1_expected);
 
 -- REF1d: size drift across workers
 \echo
@@ -154,7 +169,7 @@ SELECT
   s.drift_pct::text || '%'     AS drift_pct,
   CASE
     WHEN s.drift_pct >= (:ref1_drift_pct)::numeric
-      THEN 'WARN: copies diverge -- recent write failed to replicate on a worker, or autovacuum ran unevenly. Inspect with citus_shards.'
+      THEN 'INFO: physical sizes differ; indexes/vacuum may explain this. Size is not a row-consistency check.'
     ELSE 'ok'
   END AS recommendation
 FROM _ref1_summary s
@@ -183,19 +198,19 @@ SELECT (
       THEN 'OK : no reference tables defined in this cluster.'
     WHEN EXISTS (
            SELECT 1 FROM _ref1_summary
-           WHERE actual_placements < (SELECT expected_placements FROM _ref1_expected)
+           WHERE missing_required > 0
          )
       THEN format(
-        'CRITICAL : %s reference table(s) have missing placements -- run SELECT replicate_reference_tables();',
+        'WARN : %s reference table(s) lack copies on data-holding nodes; inspect topology and replication state before repair.',
         (SELECT COUNT(*) FROM _ref1_summary
-          WHERE actual_placements < (SELECT expected_placements FROM _ref1_expected))
+          WHERE missing_required > 0)
       )
     WHEN EXISTS (
            SELECT 1 FROM _ref1_summary
            WHERE max_bytes >= (:ref1_size_crit_mb)::bigint * 1048576
          )
       THEN format(
-        'CRITICAL : %s reference table(s) exceed %s MB per copy; cluster footprint is that x worker count. Consider distributing instead.',
+        'WARN : %s reference table(s) exceed %s MiB per-copy size policy. Review replication/storage cost and workload requirements.',
         (SELECT COUNT(*) FROM _ref1_summary
           WHERE max_bytes >= (:ref1_size_crit_mb)::bigint * 1048576),
         (:ref1_size_crit_mb)::text
@@ -215,7 +230,7 @@ SELECT (
            WHERE max_bytes > 0 AND drift_pct >= (:ref1_drift_pct)::numeric
          )
       THEN format(
-        'WARN : %s reference table(s) have >= %s%% size drift across workers. Investigate replication. See REF1d.',
+        'INFO : %s reference table(s) have >= %s%% physical size differences; not proof of row divergence. See REF1d.',
         (SELECT COUNT(*) FROM _ref1_summary
           WHERE max_bytes > 0 AND drift_pct >= (:ref1_drift_pct)::numeric),
         (:ref1_drift_pct)::text
@@ -224,15 +239,15 @@ SELECT (
            SELECT 1 FROM _ref1_summary
            WHERE actual_placements > (SELECT expected_placements FROM _ref1_expected)
          )
-      THEN 'WARN : reference table(s) have extra placements. See REF1c.'
+      THEN 'INFO : reference copies also exist on nodes without distributed shards; retained or coordinator copies may be intentional. See REF1c.'
     ELSE format(
-      'OK : %s reference table(s), all healthy (placements complete, no drift, sizes under %s MB/copy).',
+      'OK : %s reference table(s) meet audited placement/size policy (below %s MiB/copy); row consistency not verified.',
       (SELECT COUNT(*) FROM _ref1_tables), (:ref1_size_warn_mb)::text
     )
   END
 ) AS "Advisor REF1 headline";
 
-DROP TABLE _ref1_tables;
-DROP TABLE _ref1_expected;
-DROP TABLE _ref1_placements;
-DROP TABLE _ref1_summary;
+DROP TABLE pg_temp._ref1_tables;
+DROP TABLE pg_temp._ref1_expected;
+DROP TABLE pg_temp._ref1_placements;
+DROP TABLE pg_temp._ref1_summary;

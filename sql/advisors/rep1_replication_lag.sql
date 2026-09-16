@@ -1,3 +1,5 @@
+\set advisor_id REP1
+\ir ../capabilities.sql
 -- REP1: Streaming replication & slot lag.
 -- Citus itself is a logical sharding layer on top of PostgreSQL's
 -- streaming replication -- HA in a Citus deployment is built out of
@@ -36,7 +38,7 @@
 
 \echo '==================== REP1 : streaming replication & slots ===================='
 
-DROP TABLE IF EXISTS _rep1_raw;
+DROP TABLE IF EXISTS pg_temp._rep1_raw;
 CREATE TEMP TABLE _rep1_raw (nodeid int, success boolean, result text);
 
 INSERT INTO _rep1_raw (nodeid, success, result)
@@ -97,7 +99,7 @@ FROM run_command_on_all_nodes($CMD$
   )::text
 $CMD$, parallel := true) r;
 
-DROP TABLE IF EXISTS _rep1;
+DROP TABLE IF EXISTS pg_temp._rep1;
 CREATE TEMP TABLE _rep1 AS
 SELECT
   n.nodeid, n.nodename, n.nodeport, n.groupid,
@@ -153,7 +155,7 @@ LIMIT :top_n;
 -- ---------------------------------------------------------------------
 -- REP1b: replication slots
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _rep1_slots;
+DROP TABLE IF EXISTS pg_temp._rep1_slots;
 CREATE TEMP TABLE _rep1_slots AS
 SELECT
   r.role, r.nodename||':'||r.nodeport AS node,
@@ -184,7 +186,7 @@ SELECT
       THEN format('WARN: inactive slot retains %s WAL',
                   pg_size_pretty(wal_retained_b))
     WHEN slot_name LIKE 'citus\_shard\_%' AND NOT active
-      THEN 'WARN: orphaned Citus rebalancer slot -- investigate pg_dist_cleanup'
+      THEN 'INFO: inactive Citus-named slot; determine ownership and active move/cleanup state before action'
     WHEN wal_retained_b >= (:rep1_slot_crit_mb)::bigint * 1024 * 1024
       THEN format('WARN: active slot retains %s WAL (>= %s MB)',
                   pg_size_pretty(wal_retained_b),
@@ -211,14 +213,14 @@ SELECT
          AND (p->'recovery'->>'last_replay_ts') IS NOT NULL
          AND now() - (p->'recovery'->>'last_replay_ts')::timestamptz
              > make_interval(secs => (:rep1_replay_lag_crit_s)::int)
-      THEN format('CRITICAL: standby has not replayed for %s s',
+      THEN format('INFO: last replayed transaction was %s s ago; idle primary may explain this; compare receive/replay LSNs',
                   ROUND(EXTRACT(EPOCH FROM now() -
                        (p->'recovery'->>'last_replay_ts')::timestamptz)::numeric, 1))
     WHEN (p->'recovery'->>'in_recovery')::bool
          AND (p->'recovery'->>'last_replay_ts') IS NOT NULL
          AND now() - (p->'recovery'->>'last_replay_ts')::timestamptz
              > make_interval(secs => (:rep1_replay_lag_warn_s)::int)
-      THEN format('WARN: standby has not replayed for %s s',
+      THEN format('INFO: last replayed transaction was %s s ago; not a lag measurement without primary activity',
                   ROUND(EXTRACT(EPOCH FROM now() -
                        (p->'recovery'->>'last_replay_ts')::timestamptz)::numeric, 1))
     ELSE 'ok'
@@ -244,6 +246,7 @@ SELECT
       THEN 'WARN: synchronous_commit=' || (p->'settings'->>'synchronous_commit')
            || ' but synchronous_standby_names is empty (falls back to local flush silently)'
     WHEN p->'settings'->>'synchronous_standby_names' <> ''
+     AND p->'settings'->>'synchronous_commit' NOT IN ('off', 'local')
      AND NOT EXISTS (
            SELECT 1 FROM _rep1 x,
            jsonb_array_elements(
@@ -280,6 +283,7 @@ SELECT (
     WHEN EXISTS (
       SELECT 1 FROM _rep1 x
       WHERE x.p->'settings'->>'synchronous_standby_names' <> ''
+        AND x.p->'settings'->>'synchronous_commit' NOT IN ('off', 'local')
         AND NOT EXISTS (
               SELECT 1 FROM jsonb_array_elements(
                 CASE WHEN jsonb_typeof(x.p->'senders')='array'
@@ -301,18 +305,19 @@ SELECT (
     )
       THEN format('WARN : replay_lag exceeds %s s on some sender(s).',
                   (:rep1_replay_lag_warn_s)::text)
-    WHEN EXISTS (SELECT 1 FROM _rep1_slots WHERE slot_name LIKE 'citus\_shard\_%' AND NOT active)
-      THEN 'WARN : orphaned Citus rebalancer replication slot(s) detected. See REP1b.'
+    WHEN EXISTS (SELECT 1 FROM _rep1_slots WHERE wal_retained_b >= (:rep1_slot_crit_mb)::bigint * 1024 * 1024)
+      THEN 'WARN : slot WAL-retention policy threshold exceeded, including active slots. Compare disk headroom and consumer progress.'
     WHEN (SELECT count(*) FROM _rep1_slots) = 0
          AND (SELECT count(*) FROM _rep1,
                 jsonb_array_elements(
                   CASE WHEN jsonb_typeof(p->'senders')='array'
                        THEN p->'senders' ELSE '[]'::jsonb END)) = 0
-      THEN 'OK : no replication senders or slots configured (no HA in this deployment).'
-    ELSE 'OK : streaming replication healthy, all slots active with bounded WAL retention.'
+      THEN 'INFO : no senders or slots visible on responding nodes; HA topology is not established by this snapshot.'
+    ELSE 'INFO : replication snapshot collected; compare lag, slot ownership, WAL status and disk headroom over time.'
   END
 ) AS "Advisor REP1 headline";
 
-DROP TABLE _rep1_raw;
-DROP TABLE _rep1;
-DROP TABLE _rep1_slots;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._rep1_raw;
+DROP TABLE pg_temp._rep1;
+DROP TABLE pg_temp._rep1_slots;

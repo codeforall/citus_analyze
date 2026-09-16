@@ -1,3 +1,5 @@
+\set advisor_id R1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / R1 : in-flight rebalance / background-job health
 -- ---------------------------------------------------------------------
@@ -60,7 +62,7 @@ ORDER BY state;
 SELECT job_id, state, job_type,
        started_at,
        round(extract(epoch FROM (now() - started_at))/60, 1) AS running_min,
-       left(description, 80) AS description
+      '[omitted]' AS description
 FROM pg_dist_background_job
 WHERE state IN ('scheduled','running','cancelling','failing')
 ORDER BY started_at NULLS FIRST;
@@ -85,14 +87,16 @@ ORDER BY j.job_id, t.status;
 \echo
 \echo '-- Tasks in error / retry loop (across ALL jobs) --'
 SELECT job_id, task_id, status, retry_count, pid,
-       left(message, 120)                                      AS message,
+      '[omitted; inspect restricted server logs]' AS message,
        CASE
          WHEN retry_count >= :error_retry_crit THEN 'CRITICAL : persistent failure; investigate and citus_task_wait or cancel'
          WHEN retry_count >= :error_retry_warn THEN 'WARN     : retry loop'
          ELSE 'INFO'
        END                                                     AS verdict
 FROM pg_dist_background_task
-WHERE status = 'error' OR retry_count > 0
+WHERE (status = 'error' OR retry_count > 0)
+  AND status NOT IN ('done','cancelled','unscheduled')
+  AND job_id IN (SELECT job_id FROM pg_dist_background_job WHERE state IN ('running','failing','scheduled','cancelling'))
 ORDER BY retry_count DESC
 LIMIT 20;
 
@@ -103,9 +107,9 @@ SELECT t.job_id, t.task_id, t.status, t.pid,
        round(extract(epoch FROM (now() - j.started_at))/60, 1) AS job_running_min,
        CASE
          WHEN extract(epoch FROM (now() - j.started_at))/60 >= :stuck_min
-              THEN format('CRITICAL : job has been running > %s min; investigate', :stuck_min::text)
+              THEN format('INFO : parent job age > %s min; task start time/progress must be checked separately', :stuck_min::text)
          WHEN extract(epoch FROM (now() - j.started_at))/60 >= :long_running_min
-              THEN format('WARN     : job has been running > %s min', :long_running_min::text)
+              THEN format('INFO : parent job age > %s min; this is not task runtime', :long_running_min::text)
          ELSE 'OK' END                                         AS verdict
 FROM pg_dist_background_task t
 JOIN pg_dist_background_job  j USING (job_id)
@@ -144,10 +148,10 @@ ORDER BY table_name, shardid;
 
 WITH sums AS (
     SELECT
-        (SELECT count(*) FROM pg_dist_background_job WHERE state IN ('scheduled','running')) AS active_jobs,
-        (SELECT count(*) FROM pg_dist_background_job WHERE state IN ('failing','failed'))     AS failed_jobs,
-        (SELECT count(*) FROM pg_dist_background_task WHERE status='error')                   AS error_tasks,
-        (SELECT max(retry_count) FROM pg_dist_background_task)                                AS max_retries,
+        (SELECT count(*) FROM pg_dist_background_job WHERE state IN ('scheduled','running','failing','cancelling')) AS active_jobs,
+        (SELECT count(*) FROM pg_dist_background_job WHERE state='failing' OR (state='failed' AND finished_at >= now() - interval '1 day')) AS failed_jobs,
+        (SELECT count(*) FROM pg_dist_background_task WHERE status='error' AND job_id IN (SELECT job_id FROM pg_dist_background_job WHERE state IN ('running','failing','scheduled','cancelling'))) AS error_tasks,
+        (SELECT max(retry_count) FROM pg_dist_background_task WHERE status NOT IN ('done','cancelled') AND job_id IN (SELECT job_id FROM pg_dist_background_job WHERE state IN ('running','failing','scheduled','cancelling'))) AS max_retries,
         (SELECT count(*) FROM pg_dist_background_task WHERE status='running')                 AS running_tasks,
         (SELECT count(*) FROM get_rebalance_progress())                                       AS moves_in_flight,
         (SELECT extract(epoch FROM (now() - min(started_at)))/60
@@ -159,10 +163,10 @@ SELECT
     WHEN active_jobs = 0 AND failed_jobs = 0 AND error_tasks = 0
       THEN 'OK : background-job queue is idle and clean.'
     WHEN coalesce(max_retries,0) >= :error_retry_crit
-      THEN format('CRITICAL : %s error task(s), max retry_count=%s. Manual intervention required.',
+      THEN format('WARN : %s error task(s), max retry_count=%s on active jobs. Inspect recent errors and progress before intervention.',
                   error_tasks, max_retries)
     WHEN oldest_active_min >= :stuck_min
-      THEN format('CRITICAL : oldest active job has been running %s min. Investigate wedged task.',
+      THEN format('INFO : oldest active job age %s min; repeated progress samples needed to diagnose a stall.',
                   round(oldest_active_min::numeric, 1))
     WHEN failed_jobs > 0
       THEN format('WARN : %s failed job(s). Inspect pg_dist_background_task.message.', failed_jobs)

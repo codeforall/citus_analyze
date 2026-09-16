@@ -1,3 +1,5 @@
+\set advisor_id B1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / B1 : table bloat & autovacuum lag (per-shard aware)
 -- ---------------------------------------------------------------------
@@ -66,7 +68,7 @@
 -- The remote payload deliberately does NOT reference pg_dist_shard --
 -- shard mapping happens on the coordinator (always has metadata).
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _b1_raw;
+DROP TABLE IF EXISTS pg_temp._b1_raw;
 CREATE TEMP TABLE _b1_raw (nodeid int, success boolean, result text);
 
 -- Build the remote command outside any dollar-quoted block so psql
@@ -83,8 +85,8 @@ FROM (
       SELECT set_config('citus.override_table_visibility','off', true)
     ),
     stats_age AS (
-      SELECT EXTRACT(EPOCH FROM (now() - min(stats_reset)))::bigint AS sec
-      FROM pg_stat_database WHERE stats_reset IS NOT NULL
+      SELECT EXTRACT(EPOCH FROM (now() - stats_reset))::bigint AS sec
+      FROM pg_stat_database WHERE datname = current_database()
     ),
     relopts AS (
       SELECT c.oid AS relid,
@@ -158,7 +160,7 @@ FROM (
 -- ---------------------------------------------------------------------
 -- Parse per-node payload.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _b1;
+DROP TABLE IF EXISTS pg_temp._b1;
 CREATE TEMP TABLE _b1 AS
 SELECT
     CASE WHEN n.groupid = 0 THEN 'coordinator'
@@ -176,7 +178,7 @@ WHERE n.isactive;
 -- ---------------------------------------------------------------------
 -- Coord-side shard map -- same trick as I1 for schema-safe matching.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _b1_shard_map;
+DROP TABLE IF EXISTS pg_temp._b1_shard_map;
 CREATE TEMP TABLE _b1_shard_map AS
 SELECT
     pn.nspname                                          AS parent_schema,
@@ -193,7 +195,7 @@ CREATE INDEX ON _b1_shard_map (parent_schema, shard_rel);
 -- ---------------------------------------------------------------------
 -- Flatten + classify (shard vs local).
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _b1_flat;
+DROP TABLE IF EXISTS pg_temp._b1_flat;
 CREATE TEMP TABLE _b1_flat AS
 SELECT
     b.role, b.node, b.groupid,
@@ -323,8 +325,7 @@ SELECT
     -- Recommend lowering scale_factor proportional to overshoot.
     CASE
       WHEN max_av_trigger > 0 AND worst_shard_dead > max_av_trigger
-        THEN GREATEST(0.02,
-               LEAST(current_sf,
+        THEN LEAST(current_sf, GREATEST(0.02,
                      round((current_sf * max_av_trigger
                             / NULLIF(worst_shard_dead,0))::numeric, 3)))
       ELSE NULL
@@ -397,12 +398,12 @@ SELECT CASE
     format('WARN : %s relation(s) >= %s%% dead tuples (estimated). %s past-due autovacuum target(s). See B1a/B1b/B1d for suggested scale_factor.',
            warn_n, (:'warn_dead_pct'), pastdue_n)
   WHEN pastdue_n > 0 THEN
-    format('WARN : %s relation(s) past their autovacuum trigger but not yet vacuumed. Autovacuum may be falling behind; consider lowering autovacuum_vacuum_scale_factor (see B1d) or raising autovacuum_max_workers / autovacuum_naptime.',
+    format('WARN : %s relation(s) exceed estimated vacuum triggers. Check vacuum progress, blockers and IO over time; consider threshold tuning or a shorter autovacuum_naptime only after confirming lag.',
            pastdue_n)
   WHEN av_saturated THEN
-    'WARN : autovacuum_max_workers fully busy on at least one node. Consider raising autovacuum_max_workers or autovacuum_vacuum_cost_limit.'
+    'INFO : all autovacuum workers busy at this instant; sustained backlog and IO evidence needed before tuning.'
   WHEN stale_n > 0 THEN
-    format('WARN : %s relation(s) have stale ANALYZE (> %s days). Plans on distributed queries may use wrong row estimates.',
+    format('INFO : %s relation(s) have ANALYZE timestamps older than %s days. STAT1 checks churn; age alone does not prove stale estimates.',
            stale_n, (:'stale_analyze_days'))
   WHEN min_stats_age IS NOT NULL AND min_stats_age < 3600 THEN
     format('INFO : pg_stat counters reset only %s s ago on at least one node; bloat estimate is unreliable until autovacuum updates n_dead_tup. Re-run later.',
@@ -410,12 +411,13 @@ SELECT CASE
   WHEN unreachable > 0 THEN
     format('WARN : %s node(s) unreachable; bloat partially verified.', unreachable)
   ELSE
-    'OK : no significant bloat, autovacuum keeping up, ANALYZE fresh.'
+    'OK : no dead-tuple policy thresholds exceeded among sampled relations; physical bloat and sustained vacuum throughput not measured.'
 END
 FROM sig;
 \pset tuples_only off
 
-DROP TABLE IF EXISTS _b1_flat;
-DROP TABLE IF EXISTS _b1_shard_map;
-DROP TABLE IF EXISTS _b1;
-DROP TABLE IF EXISTS _b1_raw;
+DROP TABLE IF EXISTS pg_temp._b1_flat;
+DROP TABLE IF EXISTS pg_temp._b1_shard_map;
+DROP TABLE IF EXISTS pg_temp._b1;
+\ir ../advisor_coverage.sql
+DROP TABLE IF EXISTS pg_temp._b1_raw;

@@ -1,3 +1,5 @@
+\set advisor_id I1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / I1 : index health (per-shard aware)
 -- ---------------------------------------------------------------------
@@ -63,7 +65,7 @@
 --                         non-Citus tables with idx_scan=0 (cluster-
 --                         local hygiene; surfaced from coord only)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1_raw;
+DROP TABLE IF EXISTS pg_temp._i1_raw;
 CREATE TEMP TABLE _i1_raw (nodeid int, success boolean, result text);
 
 -- The remote payload deliberately does NOT reference pg_dist_shard --
@@ -88,8 +90,8 @@ FROM (
       SELECT set_config('citus.override_table_visibility','off', true)
     ),
     stats_age AS (
-      SELECT EXTRACT(EPOCH FROM (now() - min(stats_reset)))::bigint AS sec
-      FROM pg_stat_database WHERE stats_reset IS NOT NULL
+      SELECT EXTRACT(EPOCH FROM (now() - stats_reset))::bigint AS sec
+      FROM pg_stat_database WHERE datname = current_database()
     ),
     inv AS (
       SELECT jsonb_agg(jsonb_build_object(
@@ -136,15 +138,15 @@ FROM (
     )::text
   $CMD$,
     CASE WHEN current_setting('server_version_num')::int >= 160000
-         THEN 's.last_idx_scan'
-         ELSE 'NULL::timestamptz' END,
+         THEN 'to_jsonb(s)->>''last_idx_scan'''
+         ELSE 'to_jsonb(s)->>''last_idx_scan''' END,
     ((:'min_idx_size_mb')::bigint * 1024 * 1024)) AS c
 ) cmd, run_command_on_all_nodes(cmd.c, parallel := true) r;
 
 -- ---------------------------------------------------------------------
 -- Parse payload into per-node parsed table.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1;
+DROP TABLE IF EXISTS pg_temp._i1;
 CREATE TEMP TABLE _i1 AS
 SELECT
     CASE WHEN n.groupid = 0 THEN 'coordinator'
@@ -164,7 +166,7 @@ WHERE n.isactive;
 -- (shard_relname). pg_dist_shard.logicalrelid is resolved to OID and
 -- joined to pg_class+pg_namespace so we never compare ::text vs relname.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1_shard_map;
+DROP TABLE IF EXISTS pg_temp._i1_shard_map;
 CREATE TEMP TABLE _i1_shard_map AS
 SELECT
     pn.nspname                                          AS parent_schema,
@@ -184,7 +186,7 @@ CREATE INDEX ON _i1_shard_map (parent_schema, shard_rel);
 -- local relation. Schema-safe: we match (schema, rel) tuples, never
 -- bare relnames.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1_all;
+DROP TABLE IF EXISTS pg_temp._i1_all;
 CREATE TEMP TABLE _i1_all AS
 SELECT
     i.role, i.node, i.groupid,
@@ -238,7 +240,7 @@ LIMIT :top_n;
 --       Index identity is the suffix-stripped name, matched to a real
 --       index OID on the coord-side parent table.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1_shard_usage;
+DROP TABLE IF EXISTS pg_temp._i1_shard_usage;
 CREATE TEMP TABLE _i1_shard_usage AS
 SELECT
     a.parent_schema                                     AS schema,
@@ -257,7 +259,7 @@ JOIN _i1_shard_map sm
 WHERE a.parent_rel IS NOT NULL
 GROUP BY 1, 2, 3;
 
-DROP TABLE IF EXISTS _i1_unused_dist;
+DROP TABLE IF EXISTS pg_temp._i1_unused_dist;
 CREATE TEMP TABLE _i1_unused_dist AS
 SELECT
     su.schema, su.base_tbl, su.base_idx,
@@ -289,7 +291,7 @@ LIMIT :top_n;
 -- I1c : duplicate indexes (same indrelid + same indkey signature)
 --       Coord-side check on parent tables.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _i1_dup;
+DROP TABLE IF EXISTS pg_temp._i1_dup;
 CREATE TEMP TABLE _i1_dup AS
 WITH idx AS (
   SELECT
@@ -308,13 +310,13 @@ WITH idx AS (
       i.indnkeyatts::text     || '|' ||
       i.indoption::text       || '|' ||
       coalesce(i.indcollation::text,'')  || '|' ||
-      coalesce((SELECT array_agg(opcname ORDER BY u.ord)::text
-                  FROM unnest(i.indclass) WITH ORDINALITY u(opc, ord)
-                  JOIN pg_opclass oc ON oc.oid = u.opc),'') || '|' ||
+      i.indclass::text || '|' ||
+      i.indisunique::text || '|' || coalesce(to_jsonb(i)->>'indnullsnotdistinct', 'false') || '|' ||
       coalesce(pg_get_expr(i.indpred, i.indrelid), '')   || '|' ||
       coalesce(pg_get_expr(i.indexprs, i.indrelid), '')  AS key_sig,
       pg_relation_size(i.indexrelid)              AS bytes,
-      i.indisprimary, i.indisunique
+      i.indisprimary, i.indisunique,
+      i.indisreplident OR EXISTS (SELECT 1 FROM pg_constraint WHERE conindid=i.indexrelid) AS protected
   FROM pg_index i
   JOIN pg_class ic ON ic.oid = i.indexrelid
   JOIN pg_class c  ON c.oid  = i.indrelid
@@ -338,8 +340,8 @@ SELECT
     a.schema, a.parent_table,
     a.index_name AS idx_a, b.index_name AS idx_b,
     a.bytes      AS bytes_a, b.bytes    AS bytes_b,
-    a.indisprimary OR a.indisunique     AS a_is_pk_uniq,
-    b.indisprimary OR b.indisunique     AS b_is_pk_uniq
+    a.indisprimary OR a.indisunique OR a.protected AS a_is_pk_uniq,
+    b.indisprimary OR b.indisunique OR b.protected AS b_is_pk_uniq
 FROM idx a
 JOIN idx b
   ON a.schema = b.schema
@@ -352,10 +354,8 @@ JOIN idx b
 SELECT schema, parent_table, idx_a, idx_b,
        pg_size_pretty(bytes_a) AS size_a,
        pg_size_pretty(bytes_b) AS size_b,
-       CASE WHEN a_is_pk_uniq AND NOT b_is_pk_uniq THEN 'drop ' || idx_b
-            WHEN b_is_pk_uniq AND NOT a_is_pk_uniq THEN 'drop ' || idx_a
-            WHEN bytes_a < bytes_b                 THEN 'drop ' || idx_b
-            ELSE                                        'drop ' || idx_a
+        CASE WHEN a_is_pk_uniq OR b_is_pk_uniq THEN 'protected index present; inspect constraints, dependencies and replica identity'
+          ELSE 'possible redundancy; validate workload, operator classes, dependencies and storage before removal'
        END AS suggestion
 FROM _i1_dup
 ORDER BY GREATEST(bytes_a, bytes_b) DESC
@@ -404,8 +404,10 @@ WHERE NOT EXISTS (
      AND i.indisvalid AND i.indisready AND i.indislive
      AND i.indpred IS NULL
      AND i.indexprs IS NULL
-     AND (i.indkey::int2[])[0:array_length(f.fk_cols,1)-1]
-         = f.fk_cols::int2[]
+     AND i.indnkeyatts >= cardinality(f.fk_cols)
+     AND ARRAY(SELECT attribute FROM unnest(i.indkey) WITH ORDINALITY keys(attribute, position)
+           WHERE position <= cardinality(f.fk_cols) ORDER BY attribute)
+       = ARRAY(SELECT attribute FROM unnest(f.fk_cols) attribute ORDER BY attribute)
 )
 ORDER BY f.schema, f.tbl, f.fk_name
 LIMIT :top_n;
@@ -446,10 +448,11 @@ WITH sig AS (
 )
 SELECT CASE
   WHEN invalid_n > 0 THEN
-    format('CRITICAL : %s INVALID or NOT-READY index(es) detected. Queries silently skip them. REINDEX or DROP+rebuild. See I1a.',
+    format('WARN : %s INVALID or NOT-READY index(es) detected. Check concurrent builds and intended partition-index state before repair. See I1a.',
            invalid_n)
-  WHEN min_stats_age IS NOT NULL
-       AND min_stats_age < :min_history_sec THEN
+  WHEN unreachable > 0 THEN
+    format('INCOMPLETE : %s node(s) unreachable; unused-index assessment suppressed.', unreachable)
+  WHEN min_stats_age IS NULL OR min_stats_age < :min_history_sec THEN
     format('INFO : pg_stat counters reset only %s s ago on at least one node (< %s s). Suppressing "unused" verdict; rerun later. invalid=%s dup=%s.',
            min_stats_age, :min_history_sec::text, invalid_n, dup_n)
   WHEN unused_dist_n > 0 THEN
@@ -465,10 +468,11 @@ END
 FROM sig;
 \pset tuples_only off
 
-DROP TABLE IF EXISTS _i1_dup;
-DROP TABLE IF EXISTS _i1_unused_dist;
-DROP TABLE IF EXISTS _i1_shard_usage;
-DROP TABLE IF EXISTS _i1_all;
-DROP TABLE IF EXISTS _i1_shard_map;
-DROP TABLE IF EXISTS _i1;
-DROP TABLE IF EXISTS _i1_raw;
+DROP TABLE IF EXISTS pg_temp._i1_dup;
+DROP TABLE IF EXISTS pg_temp._i1_unused_dist;
+DROP TABLE IF EXISTS pg_temp._i1_shard_usage;
+DROP TABLE IF EXISTS pg_temp._i1_all;
+DROP TABLE IF EXISTS pg_temp._i1_shard_map;
+DROP TABLE IF EXISTS pg_temp._i1;
+\ir ../advisor_coverage.sql
+DROP TABLE IF EXISTS pg_temp._i1_raw;

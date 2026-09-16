@@ -1,3 +1,5 @@
+\set advisor_id W1
+\ir ../capabilities.sql
 -- W1: WAL & checkpoint pressure.
 -- Monitors the write path that backs every commit on every worker:
 -- WAL volume, checkpoint trigger mix, archiver health, replication
@@ -20,14 +22,14 @@
 \pset border 2
 \pset format aligned
 
-\set w1_req_ratio_pct      10
-\set w1_archive_stale_min  15
-\set w1_min_wal_buffers_mb 16
+\if :{?w1_req_ratio_pct} \else \set w1_req_ratio_pct 10 \endif
+\if :{?w1_archive_stale_min} \else \set w1_archive_stale_min 15 \endif
+\if :{?w1_min_wal_buffers_mb} \else \set w1_min_wal_buffers_mb 16 \endif
 
 \echo '==================== W1 : WAL & checkpoint pressure ===================='
 
 -- Fan-out: collect per-node WAL / checkpoint / archiver stats + GUCs as JSON.
-DROP TABLE IF EXISTS _w1_raw;
+DROP TABLE IF EXISTS pg_temp._w1_raw;
 CREATE TEMP TABLE _w1_raw (nodeid int, success boolean, result text);
 
 INSERT INTO _w1_raw (nodeid, success, result)
@@ -44,7 +46,8 @@ WITH
     SELECT current_setting('server_version_num')::int AS pgv
   ),
   gucs AS (
-    SELECT jsonb_object_agg(name, setting) AS g
+    SELECT jsonb_object_agg(name, CASE WHEN name='archive_command'
+      THEN CASE WHEN setting='' THEN '' ELSE '[configured; omitted]' END ELSE setting END) AS g
     FROM pg_settings
     WHERE name IN (
       'wal_level', 'wal_compression', 'wal_buffers', 'max_wal_size',
@@ -144,7 +147,7 @@ $CMD$,
 run_command_on_all_nodes(cmd.c, parallel := true) r;
 
 -- Parse per-node JSON.
-DROP TABLE IF EXISTS _w1;
+DROP TABLE IF EXISTS pg_temp._w1;
 CREATE TEMP TABLE _w1 AS
 SELECT
   n.nodeid                     AS nodeid,
@@ -157,7 +160,7 @@ LEFT JOIN pg_dist_node n ON n.nodeid = r.nodeid
 WHERE r.success;
 
 -- Flat view of GUCs + counters per node for easy consumption.
-DROP TABLE IF EXISTS _w1_flat;
+DROP TABLE IF EXISTS pg_temp._w1_flat;
 CREATE TEMP TABLE _w1_flat AS
 SELECT
   role, nodename||':'||nodeport AS node,
@@ -223,7 +226,7 @@ SELECT role, node,
            THEN 'no checkpoints since stats_reset'
          WHEN (cp_req::numeric / (cp_timed + cp_req)) * 100 >= (:w1_req_ratio_pct)::numeric
            THEN format(
-             'WARN: %s%% requested (>%s%%). max_wal_size is too small for the workload -- raise it or lengthen checkpoint_timeout.',
+             'INFO: %s%% requested (policy %s%%), cumulative since reset. Check checkpoint causes, manual/backup activity and recent rates before tuning max_wal_size.',
              ROUND((cp_req::numeric / (cp_timed + cp_req)) * 100, 1),
              (:w1_req_ratio_pct)::text)
          ELSE 'ok'
@@ -282,15 +285,13 @@ SELECT role, node, archive_mode,
          WHEN archive_command IS NULL AND archive_library IS NULL
               OR archive_command = '' AND archive_library = ''
            THEN 'CRITICAL: archive_mode is on but no archive_command / archive_library -- WAL will pile up'
-         WHEN arch_fail > arch_ok AND arch_fail > 10
-           THEN 'CRITICAL: more failed archives than succeeded -- destination is broken'
          WHEN last_fail_time IS NOT NULL
               AND (last_arch_time IS NULL OR last_fail_time > last_arch_time)
            THEN 'WARN: most recent archive attempt failed'
          WHEN last_arch_time IS NOT NULL
               AND now() - last_arch_time > ((:w1_archive_stale_min)::int * interval '1 minute')
            THEN format(
-             'WARN: last successful archive was %s ago (> %s min). Idle cluster or stuck archiver?',
+             'INFO: last successful archive was %s ago (policy %s min); compare WAL generation and archive backlog before diagnosing a stall.',
              date_trunc('second', now() - last_arch_time)::text,
              (:w1_archive_stale_min)::text)
          ELSE 'ok'
@@ -339,7 +340,7 @@ SELECT (
            SELECT 1 FROM _w1_flat
            WHERE archive_mode IN ('on','always')
              AND ( (COALESCE(archive_command,'')='' AND COALESCE(archive_library,'')='')
-                   OR (arch_fail > arch_ok AND arch_fail > 10) )
+                 )
          )
       THEN 'CRITICAL : archive_mode is on but archiving is broken on a node -- WAL will pile up. See W1d.'
     WHEN EXISTS (
@@ -348,7 +349,7 @@ SELECT (
              AND (cp_req::numeric / (cp_timed + cp_req)) * 100 >= (:w1_req_ratio_pct)::numeric
          )
       THEN format(
-        'WARN : %s node(s) have >= %s%% requested checkpoints -- raise max_wal_size. See W1b.',
+        'INFO : %s node(s) have >= %s%% requested checkpoints cumulatively; inspect recent checkpoint causes before configuration changes. See W1b.',
         (SELECT COUNT(*) FROM _w1_flat
           WHERE (cp_timed + cp_req) > 0
             AND (cp_req::numeric / (cp_timed + cp_req)) * 100 >= (:w1_req_ratio_pct)::numeric),
@@ -373,10 +374,11 @@ SELECT (
              AND (last_arch_time IS NULL OR last_fail_time > last_arch_time)
          )
       THEN 'WARN : archiver has a recent failure on a node. See W1d.'
-    ELSE 'OK : WAL path healthy across all nodes; checkpoint mix dominated by timed, durability GUCs safe.'
+    ELSE 'OK : no audited WAL/durability policy findings on responding nodes; recent throughput and archive backlog require time-series evidence.'
   END
 ) AS "Advisor W1 headline";
 
-DROP TABLE _w1_raw;
-DROP TABLE _w1;
-DROP TABLE _w1_flat;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._w1_raw;
+DROP TABLE pg_temp._w1;
+DROP TABLE pg_temp._w1_flat;

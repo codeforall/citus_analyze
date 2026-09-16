@@ -1,3 +1,5 @@
+\set advisor_id SC1
+\ir ../capabilities.sql
 -- =====================================================================
 -- SC1 : shard-count right-sizing per colocation group
 -- ---------------------------------------------------------------------
@@ -52,7 +54,7 @@
 -- Per-colocation facts: total size, shard count, member tables.
 -- We use citus_tables for sizes because it rolls up all shards+partitions
 -- per distributed parent, which is exactly what "data in the group" means.
-DROP TABLE IF EXISTS _sc1_g;
+DROP TABLE IF EXISTS pg_temp._sc1_g;
 CREATE TEMP TABLE _sc1_g AS
 WITH dist AS (
   SELECT p.logicalrelid::regclass::text AS table_name,
@@ -65,13 +67,12 @@ WITH dist AS (
          -- citus_total_relation_size sums across all shards+placements; this
          -- is the only way to get the *data* size from the coordinator.
          -- It can throw if the table was just dropped; swallow with NULL.
-         COALESCE(
-           (SELECT citus_total_relation_size(p.logicalrelid, fail_on_error := false)),
-           0) AS bytes_total
+         (SELECT citus_total_relation_size(p.logicalrelid)) AS bytes_total
   FROM pg_dist_partition p
   JOIN pg_class c ON c.oid = p.logicalrelid
   WHERE p.partmethod = 'h'          -- hash-distributed only
     AND p.colocationid > 0
+    AND c.relkind <> 'p'
 )
 SELECT colocationid,
        count(*)                                        AS n_tables,
@@ -79,7 +80,7 @@ SELECT colocationid,
        -- Every member of a colocation group shares the same shard count;
        -- max() just picks that value from any member.
        max(shard_count)                                AS shard_count,
-       sum(bytes_total)::bigint                        AS total_bytes,
+      CASE WHEN count(bytes_total)=count(*) THEN sum(bytes_total)::bigint END AS total_bytes,
        max(bytes_total)::bigint                        AS largest_member_bytes
 FROM dist
 GROUP BY colocationid;
@@ -87,7 +88,7 @@ GROUP BY colocationid;
 -- Worker count (only data-holding primaries count; coordinators marked
 -- should_have_shards=false are correctly excluded from the min-shards
 -- floor).
-DROP TABLE IF EXISTS _sc1_ctx;
+DROP TABLE IF EXISTS pg_temp._sc1_ctx;
 CREATE TEMP TABLE _sc1_ctx AS
 SELECT
   (SELECT count(*) FROM pg_dist_node
@@ -97,7 +98,7 @@ SELECT
   (:max_shards_cap)::int        AS max_shards_cap;
 
 -- Recommendation.
-DROP TABLE IF EXISTS _sc1_rec;
+DROP TABLE IF EXISTS pg_temp._sc1_rec;
 CREATE TEMP TABLE _sc1_rec AS
 SELECT
   g.colocationid,
@@ -127,11 +128,15 @@ SELECT
 FROM _sc1_g g CROSS JOIN _sc1_ctx c;
 
 -- Classify each group.
-DROP TABLE IF EXISTS _sc1_verdict;
+DROP TABLE IF EXISTS pg_temp._sc1_verdict;
 CREATE TEMP TABLE _sc1_verdict AS
 SELECT
   r.*,
   CASE
+    WHEN r.total_bytes IS NULL THEN 'INCOMPLETE'
+    WHEN (SELECT n_workers FROM _sc1_ctx) = 0
+       OR (SELECT max_shards_cap < n_workers OR target_shard_bytes <= 0 FROM _sc1_ctx)
+      THEN 'INCOMPLETE'
     WHEN r.current_shards = r.recommended_shards                   THEN 'OK'
     -- Over-sharded: shards are tiny AND recommended is much smaller.
     WHEN r.avg_shard_bytes < (SELECT min_shard_bytes FROM _sc1_ctx)
@@ -140,7 +145,7 @@ SELECT
       THEN 'WARN'
     -- Under-sharded: recommended is much larger than current.
     WHEN r.recommended_shards >= r.current_shards / NULLIF((:sc1_significant_ratio)::numeric, 0)
-      THEN 'CRITICAL'
+      THEN 'INFO'
     ELSE 'INFO'
   END AS severity,
   CASE
@@ -158,7 +163,7 @@ SELECT severity, direction,
        current_shards,
        recommended_shards AS rec_shards,
        pg_size_pretty(total_bytes)       AS total_size,
-       pg_size_pretty(avg_shard_bytes)   AS avg_shard_size,
+      pg_size_pretty(avg_shard_bytes)   AS avg_colocated_bucket_size,
        pg_size_pretty((:target_shard_bytes)::bigint) AS target_size,
        -- Trim table list to keep the row readable.
        CASE WHEN length(tables_list) > 80
@@ -175,8 +180,8 @@ LIMIT :sc1_top_n;
 \echo
 \echo '-- SC1b. Cluster-wide roll-up --'
 SELECT
-  sum(current_shards)                                 AS current_total_shards,
-  sum(recommended_shards)                             AS recommended_total_shards,
+  sum(current_shards * n_tables)                      AS current_total_physical_shards,
+  sum(recommended_shards * n_tables)                  AS scenario_total_physical_shards,
   count(*) FILTER (WHERE severity='CRITICAL')         AS critical_groups,
   count(*) FILTER (WHERE severity='WARN')             AS warn_groups,
   count(*) FILTER (WHERE severity='INFO')             AS info_groups,
@@ -188,7 +193,7 @@ FROM _sc1_verdict;
 \pset tuples_only on
 SELECT CASE
   WHEN (SELECT count(*) FROM _sc1_verdict WHERE severity='CRITICAL') > 0 THEN
-    format('CRITICAL : %s colocation group(s) under-sharded for their data volume; SELECT citus_alter_distributed_table(<table>, shard_count => <n>) will block writes briefly. See SC1a.',
+    format('INFO : %s colocation group(s) exceed the sizing scenario. Verify alter_distributed_table support and plan locking/duration with a workload test. See SC1a.',
            (SELECT count(*) FROM _sc1_verdict WHERE severity='CRITICAL'))
   WHEN (SELECT count(*) FROM _sc1_verdict WHERE severity='WARN') > 0 THEN
     format('WARN : %s colocation group(s) over-sharded (avg shard < %s); reducing shard count saves per-backend metadata cache + planning cost. Plan a maintenance window.',
@@ -199,13 +204,15 @@ SELECT CASE
            (SELECT count(*) FROM _sc1_verdict WHERE severity='INFO'))
   WHEN (SELECT count(*) FROM _sc1_g) = 0 THEN
     'INFO : no hash-distributed colocation groups found.'
+  WHEN EXISTS (SELECT 1 FROM _sc1_verdict WHERE severity='INCOMPLETE') THEN
+    'INCOMPLETE : shard-size measurement or sizing inputs unavailable/invalid.'
   ELSE
     'OK : every colocation group is sized within ' ||
     ((:sc1_significant_ratio)::numeric * 100)::int || '% of target.'
 END AS "SC1 headline";
 \pset tuples_only off
 
-DROP TABLE _sc1_verdict;
-DROP TABLE _sc1_rec;
-DROP TABLE _sc1_ctx;
-DROP TABLE _sc1_g;
+DROP TABLE pg_temp._sc1_verdict;
+DROP TABLE pg_temp._sc1_rec;
+DROP TABLE pg_temp._sc1_ctx;
+DROP TABLE pg_temp._sc1_g;

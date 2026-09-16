@@ -1,3 +1,5 @@
+\set advisor_id STAT1
+\ir ../capabilities.sql
 -- STAT1: Statistics freshness for the distributed planner.
 -- Stale planner statistics produce bad plans (wrong join order, wrong
 -- index, wrong shard pruning). On Citus this is amplified: every
@@ -34,7 +36,7 @@
 \echo '==================== STAT1 : statistics freshness ===================='
 
 -- Fan-out: per-node snapshot of pg_stat_user_tables + default_statistics_target.
-DROP TABLE IF EXISTS _stat1_raw;
+DROP TABLE IF EXISTS pg_temp._stat1_raw;
 CREATE TEMP TABLE _stat1_raw (nodeid int, success boolean, result text);
 
 INSERT INTO _stat1_raw (nodeid, success, result)
@@ -69,7 +71,8 @@ FROM (
       JOIN pg_namespace n  ON n.oid = c.relnamespace
       WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
         AND c.relkind IN ('r','p')
-        AND c.reltuples >= %s
+           AND (greatest(c.reltuples, s.n_live_tup, s.n_mod_since_analyze) >= %s
+             OR (c.reltuples < 0 AND pg_relation_size(c.oid) > 0))
     ),
     settings AS (
       SELECT jsonb_build_object(
@@ -87,7 +90,7 @@ FROM (
 run_command_on_all_nodes(cmd.c, parallel := true) r;
 
 -- Parse + tag with role
-DROP TABLE IF EXISTS _stat1;
+DROP TABLE IF EXISTS pg_temp._stat1;
 CREATE TEMP TABLE _stat1 AS
 SELECT
   n.nodeid,
@@ -99,7 +102,7 @@ JOIN pg_dist_node n ON n.nodeid = r.nodeid
 WHERE r.success;
 
 -- Coord-side shard-map for matching shard relnames back to parents.
-DROP TABLE IF EXISTS _stat1_shard_map;
+DROP TABLE IF EXISTS pg_temp._stat1_shard_map;
 CREATE TEMP TABLE _stat1_shard_map AS
 SELECT
   pn.nspname                      AS parent_schema,
@@ -114,7 +117,7 @@ JOIN pg_namespace pn ON pn.oid = pc.relnamespace;
 CREATE INDEX ON _stat1_shard_map (parent_schema, shard_rel);
 
 -- Flatten per-rel stream
-DROP TABLE IF EXISTS _stat1_rels;
+DROP TABLE IF EXISTS pg_temp._stat1_rels;
 CREATE TEMP TABLE _stat1_rels AS
 SELECT
   s.role, s.nodename||':'||s.nodeport AS node, s.nodeid,
@@ -145,22 +148,25 @@ SET last_any = GREATEST(last_manual, last_auto);
 -- ---------------------------------------------------------------------
 -- STAT1a: Distributed tables aggregated by parent
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _stat1_dist;
+DROP TABLE IF EXISTS pg_temp._stat1_dist;
 CREATE TEMP TABLE _stat1_dist AS
 SELECT
   r.parent_schema                                     AS schema,
   r.parent_rel                                        AS parent_table,
   count(*)                                            AS n_shards,
-  count(*) FILTER (WHERE last_any IS NULL)            AS shards_never_analyzed,
+  count(*) FILTER (WHERE last_any IS NULL AND reltuples < 0) AS shards_never_analyzed,
   min(last_any)                                       AS oldest_analyze,
   max(last_any)                                       AS newest_analyze,
   EXTRACT(EPOCH FROM (max(last_any) - min(last_any))) / 86400 AS analyze_drift_days,
   sum(n_mod)::bigint                                  AS total_mods_since_analyze,
-  sum(reltuples)::bigint                              AS total_reltuples,
+  sum(greatest(reltuples, n_live, 0))::bigint            AS total_reltuples,
   avg(n_ext_stats)::int                               AS avg_ext_stats
 FROM _stat1_rels r
 WHERE r.parent_rel IS NOT NULL
 GROUP BY 1,2;
+
+SELECT 'INFO : some relations have stored row estimates but no recorded ANALYZE timestamp; statistics reset may explain the missing history' AS finding
+WHERE EXISTS (SELECT 1 FROM _stat1_rels WHERE last_any IS NULL AND reltuples >= 0);
 
 \echo
 \echo '-- STAT1a. Distributed-table stats summary --'
@@ -178,14 +184,14 @@ SELECT
        ELSE 0 END                                                  AS churn_pct,
   CASE
     WHEN shards_never_analyzed = n_shards
-      THEN 'CRITICAL: NO shard has been analyzed -- ANALYZE this table.'
+      THEN 'WARN: no collected shard has a row estimate or recorded ANALYZE; inspect nonempty relations and statistics visibility'
     WHEN shards_never_analyzed > 0
       THEN format('WARN: %s of %s shards never analyzed -- run ANALYZE', shards_never_analyzed, n_shards)
-    WHEN oldest_analyze IS NOT NULL
+    WHEN oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
          AND now() - oldest_analyze > ((:stat1_crit_days)::int * interval '1 day')
       THEN format('CRITICAL: oldest shard analyze is %s days old -- run ANALYZE',
                   ROUND(EXTRACT(EPOCH FROM now()-oldest_analyze)::numeric / 86400, 1))
-    WHEN oldest_analyze IS NOT NULL
+    WHEN oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
          AND now() - oldest_analyze > ((:stat1_stale_days)::int * interval '1 day')
       THEN format('WARN: oldest shard analyze is %s days old',
                   ROUND(EXTRACT(EPOCH FROM now()-oldest_analyze)::numeric / 86400, 1))
@@ -196,7 +202,7 @@ SELECT
                   ROUND((total_mods_since_analyze::numeric / total_reltuples) * 100, 1),
                   (:stat1_churn_pct)::text)
     WHEN analyze_drift_days > 1
-      THEN format('WARN: analyze time drifts %s days across shards -- plans will differ',
+      THEN format('INFO: analyze timestamps differ by %s days; this alone does not establish inconsistent estimates',
                   ROUND(analyze_drift_days::numeric, 1))
     ELSE 'ok'
   END AS verdict
@@ -308,18 +314,18 @@ SELECT (
            WHERE shards_never_analyzed = n_shards
          )
       THEN format(
-        'CRITICAL : %s distributed table(s) have NO analyzed shards. Run ANALYZE.',
+        'WARN : %s distributed table(s) lack row estimates and ANALYZE history on every collected shard. Review nonempty relations and statistics visibility.',
         (SELECT COUNT(*) FROM _stat1_dist WHERE shards_never_analyzed = n_shards)
       )
     WHEN EXISTS (
            SELECT 1 FROM _stat1_dist
-           WHERE oldest_analyze IS NOT NULL
+           WHERE oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
              AND now() - oldest_analyze > ((:stat1_crit_days)::int * interval '1 day')
          )
       THEN format(
         'CRITICAL : %s distributed table(s) have shard analyze older than %s days.',
         (SELECT COUNT(*) FROM _stat1_dist
-          WHERE oldest_analyze IS NOT NULL
+          WHERE oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
             AND now() - oldest_analyze > ((:stat1_crit_days)::int * interval '1 day')),
         (:stat1_crit_days)::text
       )
@@ -333,13 +339,13 @@ SELECT (
       )
     WHEN EXISTS (
            SELECT 1 FROM _stat1_dist
-           WHERE oldest_analyze IS NOT NULL
+           WHERE oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
              AND now() - oldest_analyze > ((:stat1_stale_days)::int * interval '1 day')
          )
       THEN format(
         'WARN : %s distributed table(s) have shards older than %s days since analyze.',
         (SELECT COUNT(*) FROM _stat1_dist
-          WHERE oldest_analyze IS NOT NULL
+          WHERE oldest_analyze IS NOT NULL AND total_mods_since_analyze > 0
             AND now() - oldest_analyze > ((:stat1_stale_days)::int * interval '1 day')),
         (:stat1_stale_days)::text
       )
@@ -363,12 +369,13 @@ SELECT (
                  < (:stat1_default_target_low)::int
          )
       THEN 'WARN : default_statistics_target too low on one or more nodes. See STAT1e.'
-    ELSE 'OK : statistics are fresh and consistent across shards.'
+    ELSE 'OK : no statistics age-and-churn policy thresholds exceeded in collected evidence; estimates not independently validated.'
   END
 ) AS "Advisor STAT1 headline";
 
-DROP TABLE _stat1_raw;
-DROP TABLE _stat1;
-DROP TABLE _stat1_shard_map;
-DROP TABLE _stat1_rels;
-DROP TABLE _stat1_dist;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._stat1_raw;
+DROP TABLE pg_temp._stat1;
+DROP TABLE pg_temp._stat1_shard_map;
+DROP TABLE pg_temp._stat1_rels;
+DROP TABLE pg_temp._stat1_dist;

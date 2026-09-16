@@ -1,3 +1,5 @@
+\set advisor_id GR1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / GR1 : shard & partition growth memory advisor
 -- ---------------------------------------------------------------------
@@ -63,13 +65,14 @@
 -- ---------------------------------------------------------------------
 -- Gather facts + projections into a single-row temp table
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _gr1;
+DROP TABLE IF EXISTS pg_temp._gr1;
 CREATE TEMP TABLE _gr1 AS
 WITH
 facts AS (
     SELECT
-        (SELECT count(*)::int FROM pg_dist_partition WHERE partmethod IN ('h','r'))  AS dist_tables,
-        (SELECT count(*)::int FROM pg_dist_partition WHERE partmethod = 'n')         AS ref_tables,
+          (SELECT count(*)::int FROM pg_dist_partition WHERE partmethod IN ('h','r')
+            AND NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid=logicalrelid)) AS dist_tables,
+          (SELECT count(*)::int FROM pg_dist_partition WHERE partmethod = 'n' AND repmodel='t') AS ref_tables,
         (SELECT count(*)::int FROM pg_dist_shard)                                    AS shards_now,
         (SELECT count(*)::int FROM pg_dist_placement)                                AS placements_now,
         (SELECT count(DISTINCT inhparent)::int
@@ -120,7 +123,13 @@ tgt AS (
              WHEN f.part_parents_now > 0 THEN f.part_children_now / f.part_parents_now
              ELSE 0 END                                                              AS t_parts_per_parent,
         CASE WHEN :target_replication_factor >= 0 THEN :target_replication_factor ELSE f.rf_now END AS t_rf,
-        :additional_dist_tables                                                      AS t_extra_tables
+          :additional_dist_tables AS t_extra_tables,
+          CASE WHEN :target_replication_factor::int < 0 AND f.shards_now > 0
+           THEN ceil((CASE WHEN :target_total_shards >= 0 THEN :target_total_shards ELSE f.shards_now END)
+                * f.placements_now::numeric / f.shards_now)::bigint
+           ELSE (CASE WHEN :target_total_shards >= 0 THEN :target_total_shards ELSE f.shards_now END)
+             * (CASE WHEN :target_replication_factor >= 0 THEN :target_replication_factor ELSE f.rf_now END)
+           END AS t_placements_total
     FROM facts f
 )
 SELECT f.*,
@@ -128,7 +137,7 @@ SELECT f.*,
        t.t_parts_per_parent,
        t.t_rf,
        t.t_extra_tables,
-       (t.t_shards_total * t.t_rf)::bigint                                           AS t_placements_total,
+       t.t_placements_total,
        (f.dist_tables + t.t_extra_tables
            + CASE WHEN f.part_parents_now > 0
                   THEN f.part_parents_now * t.t_parts_per_parent
@@ -138,7 +147,7 @@ SELECT f.*,
        -- per-backend cache bytes (now)
        (f.shards_now * :k_meta_per_shard + f.placements_now * :k_meta_per_replica)::bigint AS c_meta_b,
        -- per-backend cache bytes (projected)
-       (t.t_shards_total * :k_meta_per_shard + (t.t_shards_total * t.t_rf) * :k_meta_per_replica)::bigint AS t_meta_b,
+      (t.t_shards_total * :k_meta_per_shard + t.t_placements_total * :k_meta_per_replica)::bigint AS t_meta_b,
        -- relcache bytes
        ((f.dist_tables + f.part_children_now + f.ref_tables) * :k_relcache)::bigint  AS c_relc_b,
        ((f.dist_tables + t.t_extra_tables
@@ -183,7 +192,7 @@ LATERAL (
           -- assume balanced distribution to the worker count.
           CASE WHEN t.t_shards_total = f.shards_now
                THEN f.max_placements_per_node
-               ELSE (t.t_shards_total * t.t_rf)::numeric / f.n_workers_eff
+               ELSE t.t_placements_total::numeric / f.n_workers_eff
           END
         )
      )::bigint
@@ -241,7 +250,7 @@ SELECT line FROM (
     format('Targets     : %s total shards, %s partitions/parent, RF=%s, +%s new dist tables',
            t_shards_total, t_parts_per_parent, t_rf, t_extra_tables) FROM _gr1
   UNION ALL SELECT 3,
-    format('Backends    : %s active now, max_connections=%s, max_prepared_transactions=%s, max_locks_per_transaction=%s',
+    format('Backends    : %s connected now, max_connections=%s, max_prepared_transactions=%s, max_locks_per_transaction=%s',
            backends_now, max_conn, max_prep, max_lpt) FROM _gr1
   UNION ALL SELECT 10, '' FROM _gr1
   UNION ALL SELECT 11, '-- Per-backend memory (coordinator; each worker sees only its placements) --' FROM _gr1
@@ -261,7 +270,7 @@ SELECT line FROM (
   UNION ALL SELECT 20, '' FROM _gr1
   UNION ALL SELECT 21, '-- Node-level extra RAM = delta_per_backend * backend_count --' FROM _gr1
   UNION ALL SELECT 22,
-    format('At current %s active backends   : +%s MB extra RSS on coordinator',
+    format('At current %s connected backends: +%s MiB assumed cache residency on coordinator',
            backends_now,
            round((backends_now * ((t_meta_b+t_relc_b)-(c_meta_b+c_relc_b))) / 1048576.0, 2)) FROM _gr1
   UNION ALL SELECT 23,
@@ -296,8 +305,8 @@ SELECT line FROM (
                 ELSE format('headroom = %s%%', round(100.0 * (1 - peak_cluster_locks::numeric / NULLIF(hash_capacity_now,0)), 0))
            END,
            CASE WHEN lpt_needed > max_lpt
-                THEN '   *** ACTION: raise max_locks_per_transaction ***'
-                ELSE '   OK — default or current value is sufficient' END) FROM _gr1
+                THEN '   scenario exceeds estimated slots; validate distinct locks and PROCLOCK demand'
+                ELSE '   scenario within estimate; actual per-node lock demand not assessed' END) FROM _gr1
   UNION ALL SELECT 37,
     format('Projected lock table : %s MB  (delta %s MB shared)',
            round(lock_bytes_needed/1048576.0, 2),
@@ -310,18 +319,18 @@ SELECT line FROM (
            AND lpt_needed <= max_lpt
         THEN 'OK : target is at or below current footprint.'
       WHEN lpt_needed > 2000
-        THEN format('CRITICAL : worst-case max_locks_per_transaction would need to be %s — unworkable. Reduce target shard count; raising the lock table this high is not viable in PostgreSQL.', lpt_needed)
+        THEN format('INFO : lock scenario suggests max_locks_per_transaction=%s. There is no universal 2000-setting limit; validate actual shared-memory cost and lock workload per node.', lpt_needed)
       WHEN (lock_bytes_needed - lock_bytes_now) / 1048576.0 > 512
-        THEN format('CRITICAL : lock table would grow by %s MB of shared memory (needs postmaster restart with raised max_locks_per_transaction to %s). Validate shared_buffers + kernel SHMMAX headroom.',
+        THEN format('INFO : estimated lock memory grows by %s MiB at scenario max_locks_per_transaction=%s. Validate version-specific shared memory before changing settings.',
                     round((lock_bytes_needed - lock_bytes_now)/1048576.0, 0), lpt_needed)
       WHEN (max_conn * ((t_meta_b+t_relc_b)-(c_meta_b+c_relc_b))) / 1048576.0 > 2048
-        THEN format('CRITICAL : worst-case extra per-backend RSS %s MB > 2 GB on coordinator. Reduce shard/partition target or lower max_connections.',
+        THEN format('INFO : hypothetical all-connected-backend metadata growth totals %s MiB on the coordinator; not a measured RSS requirement.',
                     round((max_conn * ((t_meta_b+t_relc_b)-(c_meta_b+c_relc_b))) / 1048576.0, 0))
       WHEN (max_conn * ((t_meta_b+t_relc_b)-(c_meta_b+c_relc_b))) / 1048576.0 > 512
-        THEN 'WARN : worst-case extra per-backend RSS > 512 MB on coordinator. Validate node RAM headroom.'
+        THEN 'INFO : hypothetical metadata growth exceeds 512 MiB; compare measured cache residency and active concurrency.'
       WHEN lpt_needed > max_lpt
-        THEN format('WARN : max_locks_per_transaction must rise from %s to at least %s (requires postmaster restart).', max_lpt, lpt_needed)
-      ELSE 'OK : projected growth fits within typical headroom.'
+        THEN format('INFO : scenario max_locks_per_transaction changes from %s to %s; verify distinct locks, PROCLOCK entries and concurrency before tuning.', max_lpt, lpt_needed)
+      ELSE 'INFO : modeled growth only; per-node settings and memory headroom not validated.'
     END FROM _gr1
   ORDER BY ord
 ) q;
@@ -342,14 +351,14 @@ SELECT
                   / NULLIF((SELECT placements_now FROM _gr1), 0) )
     END                                                      AS placements_projected,
     pg_size_pretty(
-      (COUNT(p.placementid) * :k_meta_per_shard
-       + COUNT(p.placementid) * (SELECT t_rf FROM _gr1) * :k_meta_per_replica
+      (COUNT(DISTINCT p.shardid) * :k_meta_per_shard
+       + COUNT(p.placementid) * :k_meta_per_replica
       )::bigint
-    )                                                        AS meta_cache_per_backend_approx
+    )                                                        AS local_placement_metadata_approx
 FROM pg_dist_node n
 LEFT JOIN pg_dist_placement p ON p.groupid = n.groupid
 WHERE n.isactive AND n.noderole = 'primary'
 GROUP BY n.nodename, n.nodeport, n.groupid
 ORDER BY (n.groupid = 0) DESC, COUNT(p.placementid) DESC;
 
-DROP TABLE _gr1;
+DROP TABLE pg_temp._gr1;

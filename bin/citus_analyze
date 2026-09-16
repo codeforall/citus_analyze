@@ -32,6 +32,7 @@
 # recommended). Some sections need superuser; they degrade to NOTICE.
 # =====================================================================
 set -u -o pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -52,6 +53,7 @@ COORD_RAM_MB=""
 WORKER_RAM_MB=""
 COORD_DISK_MB=""
 WORKER_DISK_MB=""
+ADVISOR_VARS=(-v ON_ERROR_STOP=on)
 ADVISORS_ONLY=0
 GATHER_ONLY=0
 # fail-on controls which severity level maps to a non-zero exit code.
@@ -108,17 +110,18 @@ Output options:
                            text is always produced; pdf implies html.
                            (default: text)
 
-Capacity inputs (enable hard pass/fail verdicts):
-      --coord-ram-mb=MB    coordinator RAM in MB           (advisor M1)
-      --worker-ram-mb=MB   per-worker  RAM in MB           (advisor M1)
-      --coord-disk-mb=MB   coordinator data-dir size in MB (advisor D1)
-      --worker-disk-mb=MB  per-worker  data-dir size in MB (advisor D1)
+Capacity inputs (scenario inputs, not measured resource usage):
+    --coord-ram-mb=MB    supplied coordinator RAM in MiB (advisor M1)
+    --worker-ram-mb=MB   supplied per-worker RAM in MiB  (advisor M1)
+    --coord-disk-mb=MB   filesystem capacity in MiB     (advisor D1)
+    --worker-disk-mb=MB  per-worker capacity in MiB     (advisor D1)
+    --advisor-var=K=N   numeric SQL scenario/policy input (repeatable)
 
 Run-scope options:
       --gather-only        run gather.sql only; skip advisors
       --advisors-only      run advisors only; skip gather.sql
       --fail-on=LEVEL      severity that makes the driver exit non-zero:
-                             none | warn | critical          (default: warn)
+                             none | info | warn | critical   (default: warn)
 
 Other options:
       --help               show this help and exit
@@ -126,7 +129,7 @@ Other options:
 Exit codes:
   0   no finding at or above --fail-on level
   1   at least one WARN     (when --fail-on=warn,     the default)
-  2   at least one CRITICAL (always), or a fatal error
+    2   CRITICAL under policy, or failed/incomplete collection/rendering
 
 Examples:
   citus_analyze                                        # use PG* env vars
@@ -151,6 +154,19 @@ EOF
 }
 
 while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        option="${1%%=*}"
+        value="${1#*=}"
+        shift
+        set -- "$option" "$value" "$@"
+    fi
+    case "$1" in
+        -h|--host|-p|--port|-d|--dbname|-U|--username|--uri|-o|--out-dir|--psql|--coord-ram-mb|--worker-ram-mb|--coord-disk-mb|--worker-disk-mb|--advisor-var|--fail-on|--output-format|-f)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                echo "ERROR: $1 requires a value." >&2
+                exit 2
+            fi;;
+    esac
     case "$1" in
         -h|--host)      HOSTARG="$2"; shift 2;;
         -p|--port)      PORTARG="$2"; shift 2;;
@@ -163,6 +179,12 @@ while [[ $# -gt 0 ]]; do
         --worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
         --coord-disk-mb)  COORD_DISK_MB="$2"; shift 2;;
         --worker-disk-mb) WORKER_DISK_MB="$2"; shift 2;;
+        --advisor-var)
+            if [[ ! "$2" =~ ^[a-z][a-z0-9_]*=-?[0-9]+([.][0-9]+)?$ ]]; then
+                echo 'ERROR: --advisor-var requires lower_case_name=numeric_value.' >&2
+                exit 2
+            fi
+            ADVISOR_VARS+=(-v "$2"); shift 2;;
         --advisors-only) ADVISORS_ONLY=1; shift;;
         --gather-only)  GATHER_ONLY=1; shift;;
         --fail-on)      FAIL_ON="$2"; shift 2;;
@@ -176,6 +198,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$FAIL_ON" in none|info|warn|critical) ;; *) echo 'ERROR: invalid --fail-on level.' >&2; exit 2;; esac
+WANT_HTML=0
+WANT_PDF=0
+IFS=',' read -r -a _fmts <<< "$OUTPUT_FORMAT"
+for format in "${_fmts[@]}"; do
+    case "$format" in
+        text|txt) ;;
+        html) WANT_HTML=1;;
+        pdf|all) WANT_HTML=1; WANT_PDF=1;;
+        *) echo 'ERROR: invalid --output-format; use text, html, pdf or all.' >&2; exit 2;;
+    esac
+done
+for capacity in "$COORD_RAM_MB" "$WORKER_RAM_MB" "$COORD_DISK_MB" "$WORKER_DISK_MB"; do
+    if [[ -n "$capacity" && ! "$capacity" =~ ^[0-9]+$ ]]; then
+        echo 'ERROR: capacity inputs must be non-negative integer MiB values.' >&2
+        exit 2
+    fi
+done
+if (( ADVISORS_ONLY && GATHER_ONLY )); then
+    echo 'ERROR: run-scope options are mutually exclusive.' >&2
+    exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo 'ERROR: python3 is required for structured result handling.' >&2
+    exit 2
+fi
+
 # -------- build psql argv ---------
 # preflight: check psql is actually reachable (after arg parsing so --psql wins)
 if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
@@ -186,13 +235,14 @@ if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
     exit 2
 fi
 
-PSQL_ARGS=(-X -A -q -v ON_ERROR_STOP=off)
+PSQL_ARGS=(-X -A -q -v ON_ERROR_STOP=on)
 # Make Citus shard relations visible to our pg_class-based queries.
 # (citus.override_table_visibility=on hides tenantA_102234 etc. from pg_class
 #  so tools don't drown in shard rows. We need to see them to audit them.)
 # application_name is also set for the same reason via
 # citus.show_shards_for_app_name_prefixes in case a deployment enforces it.
-export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c citus.override_table_visibility=off -c application_name=citus_analyze"
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c citus.override_table_visibility=off -c application_name=citus_analyze -c statement_timeout=120000 -c lock_timeout=5000"
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 if [[ -n "$URI" ]]; then
     PSQL_ARGS+=("$URI")
 else
@@ -214,7 +264,7 @@ PSQL_ARGS+=(-w)
 prompt_for_password() {
     local who="${USERARG:-${PGUSER:-$USER}}"
     local where
-    if [[ -n "$URI" ]]; then where="$URI"
+    if [[ -n "$URI" ]]; then where="configured URI endpoint"
     else where="${HOSTARG:-${PGHOST:-localhost}}:${PORTARG:-${PGPORT:-5432}}"
     fi
     if [[ ! -t 0 && ! -r /dev/tty ]]; then
@@ -267,6 +317,12 @@ if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="$REPORTS_DIR_DEFAULT/${TS}_${tag}"
 fi
 mkdir -p "$OUT_DIR"
+if [[ -e "$OUT_DIR/summary.txt" ]]; then
+    echo 'ERROR: output directory already contains a run; choose a new directory.' >&2
+    exit 2
+fi
+RUN_ERRORS=0
+SAW_INFO=0
 
 GATHER_OUT="$OUT_DIR/gather.out"
 GATHER_ERR="$OUT_DIR/gather.err"
@@ -309,41 +365,23 @@ fi
 CITUS_VER="$(sed -n '2p' "$OUT_DIR/preflight.out" | tr -d '\r' | awk '{$1=$1; print}')"
 echo "connected OK. citus_version: ${CITUS_VER}" | tee -a "$SUMMARY"
 
-# Auto-discover coord disk MB if running against a local coordinator and
-# the user didn't pass --coord-disk-mb. We can only reliably probe the
-# local filesystem, so worker disk still needs an explicit --worker-disk-mb.
-if [[ -z "$COORD_DISK_MB" ]]; then
-    is_local=0
-    case "${HOSTARG:-${PGHOST:-}}" in
-        ""|localhost|127.0.0.1|::1|/*) is_local=1;;
-    esac
-    if (( is_local )); then
-        if DATA_DIR="$("$PSQL_BIN" "${PSQL_ARGS[@]}" -Atc 'show data_directory' 2>/dev/null)" \
-           && [[ -n "$DATA_DIR" && -d "$DATA_DIR" ]]; then
-            if DISK_MB="$(df -Pm "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $2}')" \
-               && [[ "$DISK_MB" =~ ^[0-9]+$ ]]; then
-                COORD_DISK_MB="$DISK_MB"
-                echo "auto-discovered coord disk (${DATA_DIR}): ${COORD_DISK_MB} MB" | tee -a "$SUMMARY"
-            fi
-        fi
-    fi
-fi
-
 # =====================================================================
 # Step 1: collector
 # =====================================================================
 if [[ "$ADVISORS_ONLY" -eq 0 ]]; then
     echo "running sql/gather.sql ..." | tee -a "$SUMMARY"
     if ! "$PSQL_BIN" "${PSQL_ARGS[@]}" -f "$GATHER_SQL" > "$GATHER_OUT" 2> "$GATHER_ERR"; then
-        echo "WARN : sql/gather.sql returned non-zero; partial output may still be usable" | tee -a "$SUMMARY"
+        RUN_ERRORS=1
     fi
-    SECTIONS=$(grep -c '^### BEGIN:' "$GATHER_OUT" || echo 0)
+    if grep -qE '(ERROR|FATAL|PANIC):' "$GATHER_ERR"; then RUN_ERRORS=1; fi
+    printf '%s\n' "$RUN_ERRORS" > "$OUT_DIR/gather.status"
+    SECTIONS=$(grep -c '^### BEGIN:' "$GATHER_OUT" || true)
     GZ_SIZE=$(gzip -c "$GATHER_OUT" | wc -c)
-    echo "  gather OK: $SECTIONS sections, $(wc -l < "$GATHER_OUT") lines, ~$((GZ_SIZE/1024)) KB gzipped" | tee -a "$SUMMARY"
+    echo "  gather: $SECTIONS sections, $(wc -l < "$GATHER_OUT") lines, ~$((GZ_SIZE/1024)) KB gzipped; collection_errors=$RUN_ERRORS" | tee -a "$SUMMARY"
 fi
 
 if [[ "$GATHER_ONLY" -eq 1 ]]; then
-    exit 0
+    exit $(( RUN_ERRORS ? 2 : 0 ))
 fi
 
 # =====================================================================
@@ -351,8 +389,8 @@ fi
 # =====================================================================
 # each entry: "id:title:file"
 ADVISORS=(
-  "M1:Node memory minimum (OOM-safety):m1_node_memory_minimum.sql"
-  "D1:Disk capacity & shard-growth runway:d1_disk_capacity_runway.sql"
+    "M1:Per-node memory scenarios:m1_node_memory_minimum.sql"
+    "D1:Disk measurements & growth scenarios:d1_disk_capacity_runway.sql"
   "Q1:Long-running queries & lock waits:q1_long_running_queries.sql"
   "GUC1:Citus + PostgreSQL configuration audit:guc1_config_audit.sql"
   "V1:Version & upgrade readiness:v1_version_readiness.sql"
@@ -365,14 +403,14 @@ ADVISORS=(
   "W1:WAL & checkpoint pressure:w1_wal_checkpoint.sql"
   "STAT1:Statistics freshness:stat1_stats_freshness.sql"
   "SEC1:Security & role audit:sec1_security_audit.sql"
-  "NET1:Node reachability & latency:net1_node_reachability.sql"
+    "NET1:Node reachability & batch timing:net1_node_reachability.sql"
   "REP1:Streaming replication & slot lag:rep1_replication_lag.sql"
   "GR1:Shard/partition growth memory model:gr1_shard_growth_advisor.sql"
-  "C3:Max safe external connections (MX-aware):c3_max_external_connections.sql"
+    "C3:Connection budget scenarios:c3_max_external_connections.sql"
   "S3:Data skew across shards & workers:s3_data_skew_advisor.sql"
   "R1:Rebalance / background-job health:r1_rebalance_health.sql"
   "N6:Metadata-sync feasibility for add-node:n6_metadata_sync_feasibility.sql"
-  "A3:2PC backlog & orphan prepared xacts:a3_2pc_backlog_advisor.sql"
+    "A3:Prepared-transaction observations:a3_2pc_backlog_advisor.sql"
   "SC1:Shard-count right-sizing:sc1_shard_count_sizing.sql"
   "P2:Placement stats freshness:p2_placement_freshness.sql"
   "MX1:MX mesh connection budget:mx1_mesh_connection_budget.sql"
@@ -388,42 +426,34 @@ run_advisor() {
     local out="$OUT_DIR/${id}.out"
     local err="$OUT_DIR/${id}.err"
     if [[ ! -r "$path" ]]; then
-        HEADLINES+=("? ${id}  ${title}  -- advisor file missing: $file")
+        HEADLINES+=("INCOMPLETE ${id}  ${title}  -- advisor file missing: $file")
+        RUN_ERRORS=1
         return
     fi
+    local exit_code=0
     "$PSQL_BIN" "${PSQL_ARGS[@]}" \
         ${COORD_RAM_MB:+-v coord_ram_mb=$COORD_RAM_MB} \
         ${WORKER_RAM_MB:+-v worker_ram_mb=$WORKER_RAM_MB} \
         ${COORD_DISK_MB:+-v coord_disk_mb=$COORD_DISK_MB} \
         ${WORKER_DISK_MB:+-v worker_disk_mb=$WORKER_DISK_MB} \
-        -f "$path" > "$out" 2> "$err" || true
+        "${ADVISOR_VARS[@]}" -f "$path" > "$out" 2> "$err" || exit_code=$?
+    printf '%s\n' "$exit_code" > "$OUT_DIR/${id}.status"
 
     # Pick the most severe verdict line anywhere in the output (advisors
     # may emit several: one per sub-check). Order CRITICAL > WARN > INFO > OK.
-    local line=""
-    local sev_token=""
-    if grep -qE '^[[:space:]]*\|?[[:space:]]*CRITICAL[[:space:]]*:' "$out"; then
-        sev_token="CRITICAL"
-        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*CRITICAL[[:space:]]*:' "$out" | head -n1 \
-                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
-    elif grep -qE '^[[:space:]]*\|?[[:space:]]*WARN[[:space:]]*:' "$out"; then
-        sev_token="WARN"
-        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*WARN[[:space:]]*:' "$out" | head -n1 \
-                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
-    elif grep -qE '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out"; then
-        sev_token="OK"
-        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*OK[[:space:]]*:' "$out" | head -n1 \
-                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
-    elif grep -qE '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out"; then
-        sev_token="INFO"
-        line="$(grep -E '^[[:space:]]*\|?[[:space:]]*INFO[[:space:]]*:' "$out" | head -n1 \
-                 | sed -E 's/^[[:space:]]*\|?[[:space:]]*//; s/[[:space:]]*\|[[:space:]]*$//')"
-    fi
-    [[ -z "$line" ]] && line="(no verdict headline; see ${id}.out)"
+    local line="" sev_token="" collection="" result=""
+    result="$(python3 "$REPO_ROOT/lib/advisor_result.py" "$OUT_DIR" "$id")" || {
+        RUN_ERRORS=1
+        HEADLINES+=("INCOMPLETE ${id} ${title} -- result parsing failed")
+        return
+    }
+    IFS=$'\t' read -r sev_token collection line <<< "$result"
+    [[ "$collection" == incomplete ]] && RUN_ERRORS=1
 
     case "$sev_token" in
         CRITICAL) (( WORST < 2 )) && WORST=2;;
         WARN)     (( WORST < 1 )) && WORST=1;;
+        INFO)     SAW_INFO=1;;
     esac
     HEADLINES+=("${sev_token:-?} ${id}  ${title}  -- ${line}")
 }
@@ -460,8 +490,9 @@ badge() {
         printf "  %s %-6s  %s\n" "$(badge "$sev")" "$sev" "$rest"
     done
     echo
+    if (( RUN_ERRORS )); then echo '  COLLECTION: INCOMPLETE - health is not fully assessed.'; fi
     case "$WORST" in
-        0) echo "  OVERALL: OK   - no issues flagged.";;
+        0) if (( RUN_ERRORS )); then echo '  OVERALL: INCOMPLETE'; else echo '  OVERALL: no WARN/CRITICAL findings in available evidence.'; fi;;
         1) echo "  OVERALL: WARN - at least one advisor returned WARN.";;
         2) echo "  OVERALL: CRITICAL - at least one advisor returned CRITICAL.";;
     esac
@@ -543,7 +574,7 @@ render_pdf() {
         *)
             # Chromium-family. file:// URL required. Running with
             # --no-sandbox for non-interactive CI; safe since we control the input.
-            "$converter" --headless --disable-gpu --no-sandbox \
+            "$converter" --headless --disable-gpu \
                          --print-to-pdf="$pdf" \
                          --print-to-pdf-no-header \
                          "file://$html" > "$log" 2>&1 || rc=$?
@@ -557,39 +588,25 @@ render_pdf() {
     return 1
 }
 
-# Parse --output-format into a normalised set. text is implicit.
-WANT_HTML=0
-WANT_PDF=0
-IFS=',' read -r -a _fmts <<< "$OUTPUT_FORMAT"
-for f in "${_fmts[@]}"; do
-    f="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]' | awk '{$1=$1}1')"
-    case "$f" in
-        ""|text|txt)  ;;
-        html)  WANT_HTML=1 ;;
-        pdf)   WANT_PDF=1 ; WANT_HTML=1 ;;
-        all)   WANT_HTML=1 ; WANT_PDF=1 ;;
-        *) echo "WARN: unknown --output-format value '$f'; valid: text|html|pdf|all" >&2 ;;
-    esac
-done
-
 if (( WANT_HTML )); then
     echo | tee -a "$SUMMARY"
     echo "rendering additional formats ..." | tee -a "$SUMMARY"
-    render_html "$OUT_DIR"
+    render_html "$OUT_DIR" || RUN_ERRORS=1
 fi
 if (( WANT_PDF )); then
-    render_pdf "$OUT_DIR"
+    render_pdf "$OUT_DIR" || RUN_ERRORS=1
 fi
 
 # Exit policy: map observed WORST severity to an exit code gated by --fail-on.
 # This lets CI pin on CRITICAL only (benign WARN noise doesn't fail the build)
 # or require full cleanliness (fail on INFO too).
 FAIL_ON_LC="$(printf '%s' "$FAIL_ON" | tr '[:upper:]' '[:lower:]')"
+if (( RUN_ERRORS )); then exit 2; fi
 case "$FAIL_ON_LC" in
     none)      exit 0;;
     critical)  exit $(( WORST >= 2 ? 2 : 0 ));;
     warn|"")   exit "$WORST";;
-    info)      exit "$WORST";;
+    info)      exit $(( WORST > 0 ? WORST : SAW_INFO ));;
     *) echo "WARN: unknown --fail-on value '$FAIL_ON'; defaulting to 'warn'." >&2
        exit "$WORST";;
 esac

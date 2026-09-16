@@ -1,3 +1,5 @@
+\set advisor_id GUC1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / GUC1 : Citus + PostgreSQL configuration audit
 -- ---------------------------------------------------------------------
@@ -59,7 +61,7 @@ SELECT CASE WHEN lower(:'warn_drift_severity') = 'info' THEN 'INFO'
 -- ---------------------------------------------------------------------
 -- Per-node snapshot of audited GUCs.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _guc_raw;
+DROP TABLE IF EXISTS pg_temp._guc_raw;
 CREATE TEMP TABLE _guc_raw (
     nodeid int, success boolean, result text
 );
@@ -122,7 +124,7 @@ $CMD$
 , parallel := true);
 
 -- Un-pivot per-node JSON into (node, name, value, ...).
-DROP TABLE IF EXISTS _guc;
+DROP TABLE IF EXISTS pg_temp._guc;
 CREATE TEMP TABLE _guc AS
 SELECT
     CASE WHEN n.groupid = 0 THEN 'coordinator'
@@ -135,7 +137,7 @@ SELECT
     kv.value->>'unit'                                       AS unit,
     kv.value->>'boot_val'                                   AS boot_val,
     kv.value->>'source'                                     AS source,
-    (r.result::jsonb ->> 'version')                         AS citus_version
+    CASE WHEN r.success THEN r.result::jsonb ->> 'version' END AS citus_version
 FROM _guc_raw r
 JOIN pg_dist_node n ON n.nodeid = r.nodeid
 LEFT JOIN LATERAL jsonb_each(
@@ -146,7 +148,7 @@ WHERE n.isactive;
 
 -- Pivot subset used by cross-setting rules. node -> (name -> value).
 -- Use a lookup helper via a materialised per-(node,name) map.
-DROP TABLE IF EXISTS _guc_map;
+DROP TABLE IF EXISTS pg_temp._guc_map;
 CREATE TEMP TABLE _guc_map AS
 SELECT node, role, groupid, name, value FROM _guc WHERE name IS NOT NULL;
 
@@ -159,7 +161,7 @@ CREATE INDEX ON _guc_map (node, name);
 -- legitimately per-node; we still surface them but at INFO severity by
 -- default (or WARN via -v warn_drift_severity=warn).
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _guc_drift;
+DROP TABLE IF EXISTS pg_temp._guc_drift;
 CREATE TEMP TABLE _guc_drift AS
 WITH agg AS (
   SELECT name,
@@ -173,46 +175,7 @@ SELECT name,
        variants,
        layout,
        CASE
-         -- Tier 1: "must match" cluster-wide. Drift CAN break the cluster
-         -- (parallel exec stalls, 2PC silently disabled, MX misroutes,
-         --  extension load mismatches on restart). Escalate to CRITICAL.
-         WHEN name IN (
-           'max_worker_processes',
-           'max_connections',
-           'max_prepared_transactions',
-           'shared_preload_libraries',
-           'wal_level',
-           'server_version_num',
-           'lc_collate', 'lc_ctype', 'lc_monetary', 'lc_numeric', 'lc_time'
-         ) THEN 'CRITICAL'
-         -- Tier 2: "should match" but won't immediately break things
-         -- (pool sizes, timeouts, safety toggles).
-         WHEN name IN (
-           'citus.max_shared_pool_size',
-           'citus.local_shared_pool_size',
-           'citus.max_adaptive_executor_pool_size',
-           'citus.node_connection_timeout',
-           'citus.recover_2pc_interval',
-           'citus.multi_shard_modify_mode',
-           'citus.enable_local_execution',
-           'citus.enable_repartition_joins',
-           'citus.shard_replication_factor',
-           'citus.task_executor_type',
-           'fsync',
-           'full_page_writes',
-           'autovacuum',
-           'track_counts'
-         ) THEN 'WARN'
-         -- Tier 2b: legitimately per-session/per-role defaults. Drift is
-         -- usually benign (e.g. citus.shard_count is the default for NEW
-         -- distributed tables and is session-settable; the shard count of
-         -- an existing table is frozen at create_distributed_table time).
-         -- Surface as INFO by default.
-         WHEN name IN (
-           'citus.shard_count'
-         ) THEN 'INFO'
-         -- Legitimately heterogeneous (RAM, work_mem, locks): severity
-         -- is user-tunable via -v warn_drift_severity=info
+         WHEN name IN ('lc_collate', 'lc_ctype') THEN 'WARN'
          ELSE :'_clamped_drift_sev'
        END                                                    AS severity
 FROM agg
@@ -229,7 +192,7 @@ LIMIT :top_n;
 -- ---------------------------------------------------------------------
 -- GUC1b : dangerous values (absolute rules, evaluated per node)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _guc_rules;
+DROP TABLE IF EXISTS pg_temp._guc_rules;
 CREATE TEMP TABLE _guc_rules (
     rule_id   text,
     severity  text,
@@ -251,7 +214,7 @@ INSERT INTO _guc_rules
 SELECT 'R2:mpt_floor',
        'WARN',
        m1.node,
-       format('max_prepared_transactions=%s < max_connections=%s on %s (minimum recommended floor is mpt >= max_connections for 2PC headroom).',
+      format('max_prepared_transactions=%s < max_connections=%s on %s (conservative capacity policy; compare with peak concurrent 2PC demand, not evidence of exhausted slots).',
               m1.value, m2.value, m1.node)
 FROM _guc_map m1 JOIN _guc_map m2 USING (node)
 WHERE m1.name='max_prepared_transactions'
@@ -263,11 +226,11 @@ WHERE m1.name='max_prepared_transactions'
 -- Rule R3: citus.recover_2pc_interval must be > 0 in a multi-node cluster
 INSERT INTO _guc_rules
 SELECT 'R3:recover_2pc_off',
-       'CRITICAL',
+  'INFO',
        node,
-       format('citus.recover_2pc_interval=0 on %s; orphaned prepared transactions will never be cleaned. See A3.', node)
+  format('Non-positive citus.recover_2pc_interval on %s; verify scheduling semantics for the installed version and inspect A3 age/capacity evidence.', node)
 FROM _guc_map
-WHERE name='citus.recover_2pc_interval' AND value='0'
+WHERE name='citus.recover_2pc_interval' AND value IN ('0', '-1')
   AND (SELECT count(*) FROM pg_dist_node WHERE isactive) > 1;
 
 -- Rule R4: idle_in_transaction_session_timeout=0 → unbounded bloat risk.
@@ -326,10 +289,10 @@ WHERE name='wal_level' AND value NOT IN ('replica', 'logical');
 --   the bottleneck. See GR1 for deeper modelling.
 INSERT INTO _guc_rules
 SELECT 'R9:coord_lpt_below_worker',
-       'WARN',
+  'INFO',
        (SELECT node FROM _guc_map
          WHERE name='max_locks_per_transaction' AND groupid=0 LIMIT 1),
-       format('coord max_locks_per_transaction=%s < min(worker)=%s; coord will be the lock-table bottleneck during distributed DDL. See GR1.',
+      format('coord max_locks_per_transaction=%s < min(worker)=%s; this alone does not determine lock capacity or a bottleneck. See GR1 scenario assumptions.',
               coord_lpt, min_worker_lpt)
 FROM (
   SELECT
@@ -351,7 +314,7 @@ INSERT INTO _guc_rules
 SELECT 'R10:pool_uncapped',
        'INFO',
        node,
-       format('citus.max_shared_pool_size=%s on %s → uncapped outbound fan-out. See C3 for connection-capacity modelling.',
+      format('citus.max_shared_pool_size=%s on %s: -1 disables throttling; 0 selects automatic max_connections. See C3 for per-peer budgets.',
               value, node)
 FROM _guc_map
 WHERE name='citus.max_shared_pool_size' AND value IN ('0','-1')
@@ -381,7 +344,7 @@ INSERT INTO _guc_rules
 SELECT 'R13:fsync_off',
        'CRITICAL',
        node,
-       format('fsync=off on %s; any crash will corrupt data on this node.', node)
+      format('fsync=off on %s; crash corruption risk. Restore durability unless this is an explicitly disposable workload.', node)
 FROM _guc_map
 WHERE name='fsync' AND value='off';
 
@@ -407,32 +370,13 @@ WHERE name='track_counts' AND value='off';
 --   renamed setting, or version drift between binaries).
 INSERT INTO _guc_rules
 SELECT 'R16:missing_guc',
-       'WARN',
+  'INFO',
        string_agg(missing_on.node, ', ' ORDER BY missing_on.node),
        format('Setting "%s" was not returned by node(s) %s; binary/extension version drift or renamed GUC across cluster.',
               expected.name,
               string_agg(missing_on.node, ', ' ORDER BY missing_on.node))
 FROM (
-  -- expected names (same list as the remote IN-clause; if you add one
-  -- above, add it here too).
-  VALUES
-    ('max_connections'),('max_prepared_transactions'),
-    ('max_locks_per_transaction'),('max_wal_senders'),
-    ('max_replication_slots'),('wal_level'),('hot_standby_feedback'),
-    ('idle_in_transaction_session_timeout'),('statement_timeout'),
-    ('lock_timeout'),('deadlock_timeout'),('track_activities'),
-    ('track_counts'),('autovacuum'),('fsync'),('full_page_writes'),
-    ('log_min_duration_statement'),('shared_buffers'),('work_mem'),
-    ('maintenance_work_mem'),
-    ('citus.max_shared_pool_size'),('citus.local_shared_pool_size'),
-    ('citus.max_adaptive_executor_pool_size'),
-    ('citus.node_connection_timeout'),('citus.recover_2pc_interval'),
-    ('citus.multi_shard_modify_mode'),('citus.enable_local_execution'),
-    ('citus.enable_repartition_joins'),('citus.shard_count'),
-    ('citus.shard_replication_factor'),('citus.task_executor_type'),
-    ('citus.log_remote_commands'),('citus.writable_standby_coordinator'),
-    ('citus.defer_drop_after_shard_move'),
-    ('citus.defer_drop_after_shard_split')
+  SELECT DISTINCT name FROM _guc_map
 ) AS expected(name)
 CROSS JOIN (
   SELECT DISTINCT node FROM _guc_map
@@ -483,14 +427,14 @@ WITH sev AS (
     (SELECT count(*) FROM _guc_raw  WHERE NOT success)                         AS unreachable
 )
 SELECT CASE
-  WHEN unreachable > 0 THEN
-    format('WARN : %s node(s) unreachable during GUC1 snapshot.', unreachable)
   WHEN crit_n + drift_crit > 0 THEN
-    format('CRITICAL : %s rule violation(s); %s must-match GUC drift(s); %s warning(s). Must-match drift breaks parallel exec / 2PC / MX routing.',
+    format('CRITICAL : %s rule violation(s); %s critical drift(s); %s warning(s). Review individual findings.',
            crit_n, drift_crit, warn_n + drift_warn)
   WHEN warn_n + drift_warn > 0 THEN
     format('WARN : %s rule warning(s); %s cross-node drift(s). Review GUC1a/GUC1b.',
            warn_n, drift_warn)
+  WHEN unreachable > 0 THEN
+    format('INCOMPLETE : %s node(s) unreachable during GUC1 snapshot.', unreachable)
   WHEN info_n + drift_info > 0 THEN
     format('INFO : %s advisory finding(s); %s informational drift(s). Cluster is functional; review at your leisure.',
            info_n, drift_info)
@@ -499,8 +443,9 @@ END
 FROM sev;
 \pset tuples_only off
 
-DROP TABLE _guc_rules;
-DROP TABLE _guc_drift;
-DROP TABLE _guc_map;
-DROP TABLE _guc;
-DROP TABLE _guc_raw;
+DROP TABLE pg_temp._guc_rules;
+DROP TABLE pg_temp._guc_drift;
+DROP TABLE pg_temp._guc_map;
+DROP TABLE pg_temp._guc;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._guc_raw;

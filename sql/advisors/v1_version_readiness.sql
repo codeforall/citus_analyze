@@ -1,3 +1,5 @@
+\set advisor_id V1
+\ir ../capabilities.sql
 -- =====================================================================
 -- citus_analyze / V1 : version & upgrade readiness
 -- ---------------------------------------------------------------------
@@ -49,7 +51,7 @@
 -- ---------------------------------------------------------------------
 -- Per-node version snapshot.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _v1_raw;
+DROP TABLE IF EXISTS pg_temp._v1_raw;
 CREATE TEMP TABLE _v1_raw (
     nodeid int, success boolean, result text
 );
@@ -92,7 +94,7 @@ $CMD$
 -- ---------------------------------------------------------------------
 -- Parse payload into one row per node.
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _v1;
+DROP TABLE IF EXISTS pg_temp._v1;
 CREATE TEMP TABLE _v1 AS
 SELECT
     CASE WHEN n.groupid = 0 THEN 'coordinator'
@@ -111,7 +113,7 @@ WHERE n.isactive;
 -- cmp_* = int[] form of a version, computed once, NULL-safe,
 --         tolerant of suffixes like "15.0devel" via regex extraction.
 -- Convention: NULL int[] means "could not parse", treated as "unknown".
-DROP TABLE IF EXISTS _v1_calc;
+DROP TABLE IF EXISTS pg_temp._v1_calc;
 CREATE TEMP TABLE _v1_calc AS
 SELECT
     role, node, groupid, success,
@@ -175,7 +177,7 @@ ORDER BY groupid, node;
 -- ---------------------------------------------------------------------
 -- V1b : extension drift (coord vs each worker)
 -- ---------------------------------------------------------------------
-DROP TABLE IF EXISTS _v1_ext;
+DROP TABLE IF EXISTS pg_temp._v1_ext;
 CREATE TEMP TABLE _v1_ext AS
 SELECT
     c.node,
@@ -186,7 +188,7 @@ FROM _v1_calc c
 LEFT JOIN LATERAL jsonb_each(COALESCE(c.extensions, '{}'::jsonb)) kv ON true
 WHERE c.success;
 
-DROP TABLE IF EXISTS _v1_ext_drift;
+DROP TABLE IF EXISTS pg_temp._v1_ext_drift;
 CREATE TEMP TABLE _v1_ext_drift AS
 WITH coord_ext AS (
   SELECT ext_name, ext_version FROM _v1_ext WHERE groupid = 0
@@ -196,7 +198,7 @@ worker_ext AS (
 )
 SELECT
     COALESCE(c.ext_name, w.ext_name)                        AS ext_name,
-    w.node                                                  AS worker_node,
+    nodes.node                                              AS worker_node,
     c.ext_version                                           AS coord_ver,
     w.ext_version                                           AS worker_ver,
     CASE
@@ -205,8 +207,9 @@ SELECT
       WHEN c.ext_version <> w.ext_version            THEN 'version-mismatch'
       ELSE 'ok'
     END                                                     AS status
-FROM coord_ext c
-FULL JOIN worker_ext w USING (ext_name)
+FROM (SELECT DISTINCT node FROM _v1_calc WHERE groupid <> 0 AND success) nodes
+CROSS JOIN coord_ext c
+LEFT JOIN worker_ext w ON w.ext_name=c.ext_name AND w.node=nodes.node
 WHERE c.ext_version IS DISTINCT FROM w.ext_version
    OR (c.ext_name IS NULL OR w.ext_name IS NULL);
 
@@ -269,7 +272,8 @@ WITH sig AS (
     min(pg_major)                                                AS min_pg_major,
     max(pg_major)                                                AS max_pg_major,
     count(DISTINCT citus_ext)      FILTER (WHERE citus_ext     IS NOT NULL) AS ext_variants,
-    count(DISTINCT citus_default)  FILTER (WHERE citus_default IS NOT NULL) AS binary_variants,
+    count(DISTINCT substring(citus_lib FROM '[0-9]+\.[0-9]+[^[:space:]]*')) FILTER (WHERE success) AS binary_variants,
+    count(*) FILTER (WHERE success AND substring(citus_lib FROM '[0-9]+\.[0-9]+[^[:space:]]*') IS NULL) AS unknown_library_versions,
     count(*) FILTER (WHERE cmp_default > cmp_ext
                        AND array_length(cmp_ext,1)     IS NOT NULL
                        AND array_length(cmp_default,1) IS NOT NULL)
@@ -282,7 +286,7 @@ WITH sig AS (
                        AND array_length(cmp_cext,1)     IS NOT NULL
                        AND array_length(cmp_cdefault,1) IS NOT NULL)
                                                                  AS columnar_update_pending_n,
-    count(*) FILTER (WHERE NOT ('citus' = ANY(string_to_array(
+    count(*) FILTER (WHERE success AND NOT ('citus' = ANY(string_to_array(
             regexp_replace(COALESCE(spl,''),'\s','','g'),','))))
                                                                  AS spl_missing_n,
     count(*) FILTER (WHERE cmp_max > cmp_ext
@@ -301,7 +305,7 @@ SELECT CASE
   -- CRITICAL signals first, so that a partially-unreachable cluster
   -- with known critical drift among reachable nodes still surfaces it.
   WHEN binary_variants > 1 THEN
-    format('CRITICAL : Citus BINARY package version differs across nodes (%s distinct values). Distributed queries may fail. Install the same Citus package on every node.%s',
+    format('CRITICAL : loaded Citus library versions differ across nodes (%s distinct values). Verify deployment and upgrade state before changes.%s',
            binary_variants,
            CASE WHEN unreachable > 0 THEN format(' [%s node(s) also unreachable]', unreachable) ELSE '' END)
   WHEN ext_variants > 1 THEN
@@ -319,6 +323,8 @@ SELECT CASE
            min_pg_major, max_pg_major)
   WHEN unreachable > 0 THEN
     format('WARN : %s node(s) unreachable during V1 snapshot. Version drift cannot be fully verified.', unreachable)
+  WHEN unknown_library_versions > 0 THEN
+    format('INCOMPLETE : loaded library version could not be interpreted on %s node(s).', unknown_library_versions)
   WHEN update_pending_n > 0 THEN
     format('WARN : %s node(s) have a pending ALTER EXTENSION citus UPDATE (binary default > installed SQL).',
            update_pending_n)
@@ -326,10 +332,10 @@ SELECT CASE
     format('WARN : %s node(s) have a pending ALTER EXTENSION citus_columnar UPDATE.',
            columnar_update_pending_n)
   WHEN ext_missing_worker > 0 THEN
-    format('WARN : %s extension(s) present on coord but missing on at least one worker. See V1b.',
+    format('INFO : %s coordinator extension/worker pairs are missing. Check whether these extensions are required remotely. See V1b.',
            ext_missing_worker)
   WHEN ext_version_mismatch > 0 THEN
-    format('WARN : %s extension(s) version-mismatched between coord and workers. See V1b.',
+    format('INFO : %s extension version differences; check distributed dependencies and compatibility. See V1b.',
            ext_version_mismatch)
   WHEN ext_worker_only > 0 THEN
     format('WARN : %s extension(s) present on a worker but missing on coord. See V1b.',
@@ -345,8 +351,9 @@ END
 FROM sig;
 \pset tuples_only off
 
-DROP TABLE _v1_ext_drift;
-DROP TABLE _v1_ext;
-DROP TABLE _v1_calc;
-DROP TABLE _v1;
-DROP TABLE _v1_raw;
+DROP TABLE pg_temp._v1_ext_drift;
+DROP TABLE pg_temp._v1_ext;
+DROP TABLE pg_temp._v1_calc;
+DROP TABLE pg_temp._v1;
+\ir ../advisor_coverage.sql
+DROP TABLE pg_temp._v1_raw;
