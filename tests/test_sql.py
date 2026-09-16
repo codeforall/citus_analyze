@@ -216,13 +216,15 @@ class SqlTests(unittest.TestCase):
         result = subprocess.run(['bash', str(ROOT / 'bin/citus_analyze'), '--psql', str(Path(BINDIR) / 'psql'),
                                  '-h', '127.0.0.1', '-p', str(self.nodes[0][1]), '-U', 'postgres', '-d', 'postgres',
                                  '-w', '--fail-on=none', '--output-format=html', '--out-dir', str(output_dir),
-                                 '--coord-ram-mb=2000', '--worker-ram-mb=2000',
+                                 '--coord-ram=2000.5MB', '--node-disk-size=1.5TB',
                                  '--advisor-var=m1_peak_connected=10', '--advisor-var=m1_peak_active=2',
                                  '--advisor-var=m1_capacity_active_pct=50', '--advisor-var=m1_growth_cache_pct=25',
                                  '--advisor-var=m1_growth_shard_mb=256',
                                  '--advisor-var=m1_internal_connections=4', '--advisor-var=m1_other_client_connections=2'],
                                 capture_output=True, text=True, env=self.env, timeout=180)
         self.assertEqual(result.returncode, 0, result.stdout[-4000:] + result.stderr[-3000:])
+        self.assertIn('assumed same as coordinator', result.stdout)
+        self.assertIn('1572864', (output_dir / 'D1.out').read_text())
         self.assertEqual(len(list(output_dir.glob('*.json'))), 25)
         html = (output_dir / 'report.html').read_text()
         self.assertIn('Memory and room to grow', html)
@@ -230,6 +232,7 @@ class SqlTests(unittest.TestCase):
         self.assertIsNotNone(json.loads((output_dir / 'M1.json').read_text())['analysis']['cluster_extra_shards'])
         self.assertIn('Application-client capacity', html)
         for node in json.loads((output_dir / 'M1.json').read_text())['analysis']['nodes']:
+            self.assertEqual(node['ram_mib'], 2000.5)
             self.assertEqual(node['application_connection_limit'], max(0, node['connection_limit'] - 6))
         if os.environ.get('CITUS_TEST_REPORT'):
             print('Fixture report:', output_dir / 'report.html')

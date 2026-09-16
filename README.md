@@ -103,10 +103,62 @@ python3 lib/render_html.py reports/<run-directory>
 
 ## Capacity Scenarios
 
+### RAM And Disk Flags
+
+| Flag | Applies To |
+| --- | --- |
+| `--coord-ram SIZE` | Coordinator RAM. |
+| `--worker-ram SIZE` | RAM of each worker. |
+| `--coord-disk SIZE` | Coordinator filesystem capacity. |
+| `--worker-disk SIZE` | Filesystem capacity of each worker. |
+| `--node-ram SIZE` | Shared RAM default for coordinator and workers. |
+| `--node-disk-size SIZE` | Shared filesystem-capacity default for coordinator and workers. |
+
+Sizes accept case-insensitive `B`, `KB`, `MB`, `GB`, `TB` and the corresponding
+`KiB`, `MiB`, `GiB`, `TiB` spellings. Like PostgreSQL size units, these are
+**1024-based**: `32GB` and `32GiB` both become `32768 MiB`. Bare numbers mean MiB.
+Decimal sizes such as `1.5GB` are accepted when they represent whole bytes;
+positive sub-MiB values are preserved, not truncated to zero. Negative, malformed,
+fractional-byte and out-of-range sizes are rejected before connecting.
+
+RAM and disk defaults are resolved independently, regardless of argument order:
+
+1. An explicit coordinator or worker value wins for that role.
+2. Otherwise, the shared `--node-*` value applies, when provided.
+3. If neither a worker nor a shared value is provided, workers inherit the
+   coordinator value. A worker-only value does not fill in the coordinator.
+
+An explicit `0` means unknown and is not replaced by a fallback. The last value
+wins when the same role flag (or its alias) is repeated. The run log shows the
+normalized MiB values and identifies shared or assumed worker values.
+
+```bash
+# All nodes have the same specs:
+./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
+  --node-ram 32GB --node-disk-size 1TB
+
+# Workers inherit both coordinator values:
+./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
+  --coord-ram 32GB --coord-disk 512GB
+
+# Shared defaults, with larger worker RAM:
+./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
+  --node-ram 32GB --node-disk-size 1TB --worker-ram 64GB
+```
+
+`--coord-disk-size`, `--worker-disk-size`, and `--node-disk` are aliases.
+The old `--coord-ram-mb`, `--worker-ram-mb`, `--coord-disk-mb` and
+`--worker-disk-mb` flags remain supported; bare values retain their MiB meaning.
+SQL variable names and internal units are unchanged. These are supplied capacity
+assumptions, not measured resources; heterogeneous worker fleets need explicit
+measurements rather than an inherited common value.
+
 `--advisor-var name=number` forwards a repeatable numeric scenario/policy input.
 Inputs apply to relevant advisors only; supported names and defaults are declared
 at the beginning of each SQL file. Non-numeric inputs can be passed to standalone
 `psql -v` after reviewing the SQL parameter contract.
+This advanced option still expects numbers, not unit suffixes. Direct capacity
+variables passed through it override the normalized capacity flags at SQL execution.
 
 ### Memory
 
@@ -125,7 +177,7 @@ capacity verdict. Supplied RAM is user input, not measured RAM. Units are MiB/Gi
 
 ```bash
 ./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
-  --coord-ram-mb=32000 --worker-ram-mb=32000 \
+  --node-ram=32GB \
   --advisor-var=m1_peak_connected=200 --advisor-var=m1_peak_active=20 \
   --advisor-var=m1_sort_ops=1 --advisor-var=m1_hash_ops=1 \
   --advisor-var=m1_temp_sessions=2 --advisor-var=m1_outbound_connections=80 \
@@ -175,7 +227,7 @@ table growth with 200 connected / 40 busy sessions kept fixed:
 
 ```bash
 ./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
-  --coord-ram-mb=32000 --worker-ram-mb=32000 \
+  --node-ram=32GB \
   --advisor-var=m1_peak_connected=200 --advisor-var=m1_peak_active=40 \
   --advisor-var=m1_capacity_active_pct=20 \
   --advisor-var=m1_capacity_headroom_pct=20 \
@@ -288,7 +340,7 @@ from tuple updates/deletes. Supply filesystem measurements and a measured trend:
 
 ```bash
 ./bin/citus_analyze -h coord.example.com -d postgres -w -f html \
-  --coord-disk-mb=102400 --worker-disk-mb=102400 \
+  --node-disk-size=100GB \
   --advisor-var=coord_disk_free_mb=40000 \
   --advisor-var=worker_disk_free_mb=50000 \
   --advisor-var=disk_growth_mb_per_day=500

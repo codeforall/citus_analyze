@@ -53,6 +53,8 @@ COORD_RAM_MB=""
 WORKER_RAM_MB=""
 COORD_DISK_MB=""
 WORKER_DISK_MB=""
+NODE_RAM_MB=""
+NODE_DISK_MB=""
 ADVISOR_VARS=(-v ON_ERROR_STOP=on)
 ADVISORS_ONLY=0
 GATHER_ONLY=0
@@ -111,11 +113,22 @@ Output options:
                            (default: text)
 
 Capacity inputs (scenario inputs, not measured resource usage):
-    --coord-ram-mb=MB    supplied coordinator RAM in MiB (advisor M1)
-    --worker-ram-mb=MB   supplied per-worker RAM in MiB  (advisor M1)
-    --coord-disk-mb=MB   filesystem capacity in MiB     (advisor D1)
-    --worker-disk-mb=MB  per-worker capacity in MiB     (advisor D1)
-    --advisor-var=K=N   numeric SQL scenario/policy input (repeatable)
+            --coord-ram=SIZE     coordinator RAM, e.g. 32GB or 32768MB
+            --worker-ram=SIZE    RAM of each worker
+            --coord-disk=SIZE    coordinator filesystem capacity
+            --worker-disk=SIZE   filesystem capacity of each worker
+            --node-ram=SIZE      shared RAM default for all nodes
+            --node-disk-size=SIZE shared filesystem-capacity default for all nodes
+            --advisor-var=K=N    numeric SQL scenario/policy input (repeatable)
+
+    Units: B, KB, MB, GB, TB (1024-based); KiB/MiB/GiB/TiB also accepted.
+    Units are case-insensitive; bare numbers mean MiB. Example: 1.5GB.
+    Role-specific flags override shared node defaults, regardless of order.
+    Without a worker or node value, workers inherit the coordinator value.
+    RAM and disk inherit separately. Explicit 0 means unknown, not missing.
+    Aliases: --coord-disk-size, --worker-disk-size, --node-disk.
+    Legacy --coord-ram-mb, --worker-ram-mb, --coord-disk-mb and
+    --worker-disk-mb remain supported; their bare numbers still mean MiB.
 
 Run-scope options:
       --gather-only        run gather.sql only; skip advisors
@@ -140,7 +153,8 @@ Examples:
   citus_analyze -h coord -d citus -f html              # + HTML report
   citus_analyze -h coord -d citus -f html,pdf          # + HTML + PDF
   citus_analyze -h coord -d citus -f all \
-                --coord-ram-mb 16384 --worker-ram-mb 32768
+                --coord-ram 16GB --worker-ram 32GB
+  citus_analyze -h coord -d citus -f html --node-ram 32GB --node-disk-size 1TB
 
 Environment variables:
   All standard libpq variables are honoured: PGHOST, PGPORT, PGDATABASE,
@@ -161,7 +175,7 @@ while [[ $# -gt 0 ]]; do
         set -- "$option" "$value" "$@"
     fi
     case "$1" in
-        -h|--host|-p|--port|-d|--dbname|-U|--username|--uri|-o|--out-dir|--psql|--coord-ram-mb|--worker-ram-mb|--coord-disk-mb|--worker-disk-mb|--advisor-var|--fail-on|--output-format|-f)
+        -h|--host|-p|--port|-d|--dbname|-U|--username|--uri|-o|--out-dir|--psql|--coord-ram|--worker-ram|--coord-disk|--worker-disk|--coord-disk-size|--worker-disk-size|--node-ram|--node-disk-size|--node-disk|--coord-ram-mb|--worker-ram-mb|--coord-disk-mb|--worker-disk-mb|--advisor-var|--fail-on|--output-format|-f)
             if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
                 echo "ERROR: $1 requires a value." >&2
                 exit 2
@@ -175,10 +189,12 @@ while [[ $# -gt 0 ]]; do
         --uri)          URI="$2"; shift 2;;
         -o|--out-dir)   OUT_DIR="$2"; shift 2;;
         --psql)         PSQL_BIN="$2"; shift 2;;
-        --coord-ram-mb)  COORD_RAM_MB="$2"; shift 2;;
-        --worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
-        --coord-disk-mb)  COORD_DISK_MB="$2"; shift 2;;
-        --worker-disk-mb) WORKER_DISK_MB="$2"; shift 2;;
+        --coord-ram|--coord-ram-mb) COORD_RAM_MB="$2"; shift 2;;
+        --worker-ram|--worker-ram-mb) WORKER_RAM_MB="$2"; shift 2;;
+        --coord-disk|--coord-disk-size|--coord-disk-mb) COORD_DISK_MB="$2"; shift 2;;
+        --worker-disk|--worker-disk-size|--worker-disk-mb) WORKER_DISK_MB="$2"; shift 2;;
+        --node-ram) NODE_RAM_MB="$2"; shift 2;;
+        --node-disk-size|--node-disk) NODE_DISK_MB="$2"; shift 2;;
         --advisor-var)
             if [[ ! "$2" =~ ^[a-z][a-z0-9_]*=-?[0-9]+([.][0-9]+)?$ ]]; then
                 echo 'ERROR: --advisor-var requires lower_case_name=numeric_value.' >&2
@@ -210,12 +226,6 @@ for format in "${_fmts[@]}"; do
         *) echo 'ERROR: invalid --output-format; use text, html, pdf or all.' >&2; exit 2;;
     esac
 done
-for capacity in "$COORD_RAM_MB" "$WORKER_RAM_MB" "$COORD_DISK_MB" "$WORKER_DISK_MB"; do
-    if [[ -n "$capacity" && ! "$capacity" =~ ^[0-9]+$ ]]; then
-        echo 'ERROR: capacity inputs must be non-negative integer MiB values.' >&2
-        exit 2
-    fi
-done
 if (( ADVISORS_ONLY && GATHER_ONLY )); then
     echo 'ERROR: run-scope options are mutually exclusive.' >&2
     exit 2
@@ -224,6 +234,13 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo 'ERROR: python3 is required for structured result handling.' >&2
     exit 2
 fi
+
+NORMALIZED_CAPACITIES="$(python3 "$REPO_ROOT/lib/capacity_args.py" \
+    --coord-ram="$COORD_RAM_MB" --worker-ram="$WORKER_RAM_MB" \
+    --coord-disk="$COORD_DISK_MB" --worker-disk="$WORKER_DISK_MB" \
+    --node-ram="$NODE_RAM_MB" --node-disk-size="$NODE_DISK_MB")" || exit 2
+IFS='|' read -r COORD_RAM_MB WORKER_RAM_MB COORD_DISK_MB WORKER_DISK_MB \
+    COORD_RAM_SOURCE WORKER_RAM_SOURCE COORD_DISK_SOURCE WORKER_DISK_SOURCE <<< "$NORMALIZED_CAPACITIES"
 
 # -------- build psql argv ---------
 # preflight: check psql is actually reachable (after arg parsing so --psql wins)
@@ -330,6 +347,16 @@ SUMMARY="$OUT_DIR/summary.txt"
 
 echo "citus_analyze run at ${TS} (UTC)" > "$SUMMARY"
 echo "output directory: $OUT_DIR"      | tee -a "$SUMMARY"
+
+if [[ -n "$COORD_RAM_MB$WORKER_RAM_MB$COORD_DISK_MB$WORKER_DISK_MB" ]]; then
+    {
+        echo 'Capacity flags normalized to MiB (scenario inputs, not measurements):'
+        printf '  Coordinator RAM: %s MiB (%s)\n' "${COORD_RAM_MB:-unknown}" "$COORD_RAM_SOURCE"
+        printf '  Worker RAM:      %s MiB (%s)\n' "${WORKER_RAM_MB:-unknown}" "$WORKER_RAM_SOURCE"
+        printf '  Coordinator disk: %s MiB (%s)\n' "${COORD_DISK_MB:-unknown}" "$COORD_DISK_SOURCE"
+        printf '  Worker disk:      %s MiB (%s)\n' "${WORKER_DISK_MB:-unknown}" "$WORKER_DISK_SOURCE"
+    } | tee -a "$SUMMARY"
+fi
 
 # -------- connectivity probe --------
 # We always pass -w to psql, so a server that needs a password and
